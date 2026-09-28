@@ -48,8 +48,13 @@ class _Rpc:
     def __init__(self, ws: aiohttp.ClientWebSocketResponse):
         self._ws = ws
         self._seq = 0
+        self._lock = asyncio.Lock()   # one reader at a time (keepalive vs. calls)
 
     async def call(self, opcode: int, payload: dict, timeout: float = 20) -> dict:
+        async with self._lock:
+            return await self._call(opcode, payload, timeout)
+
+    async def _call(self, opcode: int, payload: dict, timeout: float) -> dict:
         seq = self._seq
         self._seq += 1
         await self._ws.send_str(json.dumps(
@@ -151,6 +156,86 @@ async def verify_token(session: aiohttp.ClientSession, token: str, device_id: st
             "interactive": True, "token": token, "chatsCount": 1,
         })
         return snap.get("profile") or {}
+
+
+async def check_token(token: str, device_id: str, proxy: str | None = None) -> dict:
+    """Validate a MAX token + device id with a real login; return the profile.
+    Raises LoginError if MAX rejects it."""
+    async with aiohttp.ClientSession(headers=_BROWSER_HEADERS) as session:
+        return await verify_token(session, token, device_id, proxy)
+
+
+class PhoneLogin:
+    """Two-step phone login that keeps the MAX connection open between
+    "send me a code" and "here is the code" — for the bot's chat dialog.
+
+        login = PhoneLogin(proxy)
+        await login.start("+7999...")      # MAX sends the code
+        token, device_id, profile = await login.finish("123456")
+        await login.close()
+
+    ``finish`` raises ``CodeRejected`` for a wrong code (call it again) and
+    ``LoginError`` for anything final.
+    """
+
+    KEEPALIVE_SEC = 25
+
+    def __init__(self, proxy: str | None = None):
+        self.proxy = proxy
+        self.device_id = str(uuid.uuid4())
+        self.phone = ""
+        self._session: aiohttp.ClientSession | None = None
+        self._ws = None
+        self._rpc: _Rpc | None = None
+        self._sms_token = ""
+        self._keepalive: asyncio.Task | None = None
+
+    async def start(self, phone: str) -> str:
+        self.phone = normalize_phone(phone)
+        self._session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
+        try:
+            self._ws = await self._session.ws_connect(
+                MaxClient.WS_URL, headers=_WS_HEADERS, proxy=self.proxy)
+            self._rpc = _Rpc(self._ws)
+            self._sms_token = await request_code(self._rpc, self.device_id, self.phone)
+        except Exception:
+            await self.close()
+            raise
+        self._keepalive = asyncio.create_task(self._ping_loop())
+        return self.phone
+
+    async def _ping_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.KEEPALIVE_SEC)
+            try:
+                await self._rpc.call(OpCode.HEARTBEAT_PING, {"interactive": False})
+            except Exception:
+                return
+
+    async def finish(self, code: str) -> tuple[str, str, dict]:
+        if not self._rpc:
+            raise LoginError("вход не начат")
+        code = re.sub(r"\D", "", code or "")
+        if not code:
+            raise CodeRejected("код должен состоять из цифр")
+        token, _ = await check_code(self._rpc, self._sms_token, code)
+        await self.close()
+        async with aiohttp.ClientSession(headers=_BROWSER_HEADERS) as session:
+            profile = await verify_token(session, token, self.device_id, self.proxy)
+        return token, self.device_id, profile
+
+    async def close(self) -> None:
+        if self._keepalive:
+            self._keepalive.cancel()
+            self._keepalive = None
+        if self._ws is not None and not self._ws.closed:
+            await self._ws.close()
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+
+
+def profile_name(profile: dict) -> str:
+    return _profile_name(profile)
 
 
 def write_env(path: str, values: dict) -> None:

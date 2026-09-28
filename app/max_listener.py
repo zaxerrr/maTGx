@@ -326,7 +326,10 @@ def _human_size(n: int) -> str:
 def create_max_client(
     max_token: str, max_device_id: str, sender: TelegramSender, max_chat_ids: str | None = None,
     debug: bool = False, msgmap: MessageMap | None = None, proxy: str | None = None,
+    on_auth_failed=None,
 ) -> MaxClient:
+    """``on_auth_failed``: optional extra async callback(reason) — e.g. to
+    alert the bot owner in private chat with a "log in again" button."""
     client = MaxClient(token=max_token, device_id=max_device_id, debug=debug,
                        chat_ids=max_chat_ids, proxy=proxy)
     resolver = ContactResolver(client=client)
@@ -388,6 +391,11 @@ def create_max_client(
         if _auth_alert_sent:
             return
         _auth_alert_sent = True
+        if on_auth_failed is not None:
+            try:
+                await on_auth_failed(reason)
+            except Exception:
+                log.exception("on_auth_failed hook failed")
         await sender.send(
             "❌ <b>Max:</b> авторизация не прошла — "
             f"{escape(reason)}.\n"

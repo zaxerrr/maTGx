@@ -6,6 +6,8 @@
 
 Двусторонний мост MAX (`ws-api.oneme.ru`) ↔ Telegram через форум-топики супергруппы. Каждый MAX-чат = свой topic в Telegram. Userbot подключается WebSocket'ом к MAX по `__oneme_auth` токену, Telegram-side — обычный bot через python-telegram-bot polling.
 
+**Мульти-аккаунт.** В `.env` обязателен только `TG_BOT_TOKEN`. Владелец (первый `/start` в личке или `TG_ALLOWED_USER_ID`) настраивает в личке с ботом аккаунты MAX (вход по номеру+коду или токеном) и привязывает каждый к форум-супергруппе. Одна группа может обслуживать несколько аккаунтов — темы тогда получают префикс `<аккаунт> · `. Старый `.env` (`MAX_TOKEN`/`MAX_DEVICE_ID`/`TG_CHAT_ID`) бутстрапит аккаунт `main` со старыми путями `state/topics.json` / `state/messages.db`.
+
 Основан на [Aist/max2tg](https://github.com/Aist/max2tg), но переписан вокруг форум-топиков и расширен. Лицензия MIT.
 
 ## Структура
@@ -21,8 +23,11 @@ app/
   tg_handler.py    # TG → MAX handler + команды /bind, /add, /profile, /intro, /del, /help
   topics.py        # TopicStore: JSON-карта max_chat_id ↔ thread_id
   msgmap.py        # MessageMap: SQLite tg_msg_id ↔ (max_chat_id, max_msg_id) + последний текст
-  login.py         # `python -m app.login`: вход по телефону+коду (op 17/18) → MAX_TOKEN + MAX_DEVICE_ID
-tests/             # 292 pytest, asyncio_mode=auto
+  login.py         # PhoneLogin (двухшаговый вход op 17/18, держит WS между шагами) + CLI `python -m app.login`
+  accounts.py      # AccountStore: state/accounts.json (0600) — owner_id, аккаунты MAX, известные группы
+  bridge.py        # Bridge: по MaxClient+TelegramSender+TopicStore+MessageMap на аккаунт; resolve_topic(group, thread)
+  setup_bot.py     # диалог в личке (/start, кнопки acc:/grp:), обнаружение групп (my_chat_member, миграция)
+tests/             # 348 pytest, asyncio_mode=auto
 docs/cover.jpg     # обложка README
 state/             # runtime (топик-карта), gitignored
 logs/              # логи, gitignored
@@ -105,14 +110,22 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 - `/rm` — ответом на своё сообщение: удалить его в MAX (op 66).
 - `/del` — удалить топик с подтверждением (inline-кнопки).
 - `/help` — справка.
+- В личке: `/start` (меню: аккаунты, вход, группы), `/cancel`.
 
 ## Состояние / runtime
 
+- `state/accounts.json` — владелец, аккаунты (токены!), группы. Права 600, атомарная запись.
+- `state/accounts/<id>/topics.json|messages.db` — состояние аккаунтов, добавленных через бота; у `main` — старые пути в корне `state/`.
 - `state/topics.json` — JSON-карта `max_chat_id ↔ {topic_id, title}`. Атомарно перезаписывается (tmpfile + os.replace). Critical для непересоздавания топиков. Том должен быть mounted в docker-compose.
 - `state/messages.db` — SQLite-карта сообщений для ответов/правок/`/rm`, хранит ~50k последних строк.
 - `logs/max2tg.log` — RotatingFileHandler 10MB × 5.
 
 ## Поток сообщений (важные инварианты)
+
+- Один `Application` (polling) на всё. `bot_data["bridge"]` = `Bridge`. Хендлеры тем ищут аккаунт через `Bridge.resolve_topic(chat_id, thread_id)`; `/bind` и `/add` — через `_group_target` (при нескольких аккаунтах в группе — первый аргумент = id/имя аккаунта). Без `bridge` в bot_data работает старый одиночный режим (`build_tg_app`, ключи `max_client`/`topic_store`/…) — на нём держатся старые тесты.
+- Писать в MAX может только владелец (`_is_allowed`). Пока владельца нет — отправка заблокирована.
+- Группы бот узнаёт из `my_chat_member` (флаг форума и права берутся из самого апдейта), миграции group→supergroup (`migrate_to_chat_id`) и любого сообщения в группе (handler group -2). Bot API не умеет «список моих чатов».
+- Сообщения с кодом/токеном в личке бот удаляет сразу. Диалог живёт 10 мин (`DIALOG_TTL_SEC`), `PhoneLogin` пингует MAX, пока ждёт код.
 
 - MAX → TG: `handle_message` держит `asyncio.Lock` на чат — сообщения одного чата обрабатываются строго по порядку, топик+интро создаются один раз.
 - Сообщение MAX с уже известным id = повторная доставка (текст тот же → пропуск) или правка (текст другой → `sender.edit_text`, иначе ответ «✏️ Изменено»).
@@ -122,7 +135,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Тесты
 
-`pytest -q` → 292 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды + авторизация/watchdog/backoff + edit/delete/video/file RPC, tg_sender (split_html, пересоздание топика, reply, edit), msgmap, сквозные потоки listener/handler.
+`pytest -q` → 348 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды + авторизация/watchdog/backoff + edit/delete/video/file RPC, tg_sender (split_html, пересоздание топика, reply, edit), msgmap, сквозные потоки listener/handler.
 
 ## Деплой
 

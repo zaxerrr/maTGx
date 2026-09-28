@@ -10,11 +10,9 @@ from logging.handlers import RotatingFileHandler
 from telegram import Update
 
 from app.config import load_settings
-from app.max_listener import create_max_client
-from app.msgmap import MessageMap
-from app.tg_handler import build_tg_app
-from app.tg_sender import TelegramSender
-from app.topics import TopicStore
+from app.accounts import AccountStore
+from app.bridge import Bridge
+from app.tg_handler import REGISTRY_KEY, build_bridge_app
 
 threading.stack_size(524288)
 
@@ -82,49 +80,47 @@ async def main():
         log.info("Using MAX proxy: %s", settings.max_proxy.split("@")[-1])
 
     os.makedirs(settings.state_dir, exist_ok=True)
-    topic_store = TopicStore(os.path.join(settings.state_dir, "topics.json"))
-    msgmap = MessageMap(os.path.join(settings.state_dir, "messages.db"))
-
-    sender = TelegramSender(settings.tg_bot_token, settings.tg_chat_id, topic_store,
-                            proxy_url=settings.tg_proxy)
-    await sender.start()
-
-    client = create_max_client(
-        settings.max_token, settings.max_device_id, sender, settings.max_chat_ids,
-        debug=settings.debug, msgmap=msgmap, proxy=settings.max_proxy,
+    store = AccountStore(os.path.join(settings.state_dir, "accounts.json"))
+    legacy = store.bootstrap_from_env(
+        settings.max_token, settings.max_device_id,
+        int(settings.tg_chat_id) if settings.tg_chat_id else None,
+        settings.max_chat_ids,
     )
+    if legacy:
+        log.info("Account %r bootstrapped from .env (MAX_TOKEN / TG_CHAT_ID)", legacy.id)
 
-    tg_app = None
-    if settings.reply_enabled and settings.tg_allowed_user_id is None:
-        log.warning(
-            "TG_ALLOWED_USER_ID is not set: ANY member of the supergroup can "
-            "send messages to MAX on your behalf. Set it in .env."
-        )
-    if settings.reply_enabled:
-        tg_app = build_tg_app(settings.tg_bot_token, client, settings.tg_chat_id,
-                              topic_store, allowed_user_id=settings.tg_allowed_user_id,
-                              proxy_url=settings.tg_proxy)
-        await tg_app.initialize()
-        await tg_app.start()
-        await tg_app.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
-        log.info("Telegram polling started (reply → Max enabled)")
-    else:
-        log.info("Reply to Max disabled (REPLY_ENABLED=false)")
+    tg_app = build_bridge_app(settings.tg_bot_token, proxy_url=settings.tg_proxy)
+    bridge = Bridge(store, tg_app.bot, settings.state_dir,
+                    env_owner_id=settings.tg_allowed_user_id,
+                    max_proxy=settings.max_proxy, debug=settings.debug,
+                    reply_enabled=settings.reply_enabled)
+    tg_app.bot_data[REGISTRY_KEY] = bridge
 
-    log.info("Starting Max listener...")
+    await tg_app.initialize()
+    me = tg_app.bot.bot
+    log.info("Telegram bot ready: @%s", me.username)
+    await tg_app.start()
+    await tg_app.updater.start_polling(drop_pending_updates=True,
+                                       allowed_updates=Update.ALL_TYPES)
+    if not settings.reply_enabled:
+        log.info("REPLY_ENABLED=false: Telegram → MAX sending is off (setup dialog still works)")
+
+    await bridge.start_all()
+    if bridge.owner_id is None:
+        log.warning("No owner yet: send /start to @%s in a private chat to claim the bridge",
+                    me.username)
+    if not bridge.runtimes:
+        log.info("No MAX account running yet — configure it in the bot's private chat: /start")
+        await bridge.notify_owner("MAX-аккаунт не подключён. Откройте меню: /start")
+
     try:
-        await client.run()
+        await asyncio.Event().wait()   # until SIGTERM/SIGINT cancels main()
     finally:
         log.info("Shutting down...")
-        if tg_app:
-            await tg_app.updater.stop()
-            await tg_app.stop()
-            await tg_app.shutdown()
-        await sender.stop()
-        msgmap.close()
+        await bridge.stop_all()
+        await tg_app.updater.stop()
+        await tg_app.stop()
+        await tg_app.shutdown()
 
 
 if __name__ == "__main__":

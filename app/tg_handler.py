@@ -24,6 +24,7 @@ MAX_CLIENT_KEY = "max_client"
 TOPIC_STORE_KEY = "topic_store"
 ALLOWED_USER_KEY = "allowed_user_id"
 SUPERGROUP_KEY = "supergroup_id"
+REGISTRY_KEY = "bridge"   # app.bridge.Bridge in multi-account mode
 
 TG_BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024   # Bot API getFile limit
 
@@ -111,6 +112,74 @@ def _peer_id_in_dm(resolver, chat_id) -> int | None:
     return None
 
 
+def _bridge(context):
+    return context.bot_data.get(REGISTRY_KEY)
+
+
+def _is_allowed(update: Update, context) -> bool:
+    """Who may drive the bridge from Telegram.
+
+    Multi-account mode: only the owner (TG_ALLOWED_USER_ID or whoever
+    claimed the bot with /start). Legacy mode: TG_ALLOWED_USER_ID if set.
+    """
+    user = update.effective_user
+    br = _bridge(context)
+    if br is not None:
+        return bool(user and br.owner_id and user.id == br.owner_id)
+    allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
+    return not (allowed_user_id and user and user.id != allowed_user_id)
+
+
+def _replies_enabled(context) -> bool:
+    br = _bridge(context)
+    return br is None or br.reply_enabled
+
+
+def _topic_context(context, chat_id, thread_id):
+    """(topic_store, max_client) owning a topic, or (None, None)."""
+    br = _bridge(context)
+    if br is not None:
+        rt = br.resolve_topic(chat_id, thread_id)
+        return (rt.topic_store, rt.client) if rt else (None, None)
+    return context.bot_data.get(TOPIC_STORE_KEY), context.bot_data.get(MAX_CLIENT_KEY)
+
+
+async def _group_target(update: Update, context, args: list):
+    """Pick the MAX account a group-level command (/bind, /add) acts on.
+
+    Returns (topic_store, max_client, group_id, title_prefix, remaining_args)
+    or None after replying with a hint. With several accounts in one group
+    the first argument selects the account by id or name.
+    """
+    message = update.message
+    br = _bridge(context)
+    if br is None:
+        return (context.bot_data[TOPIC_STORE_KEY], context.bot_data[MAX_CLIENT_KEY],
+                context.bot_data[SUPERGROUP_KEY], "", args)
+    rts = br.runtimes_for_group(message.chat_id)
+    if not rts:
+        await message.reply_text(
+            "К этой группе не привязан ни один аккаунт MAX. Настройка — в личке с ботом: /start"
+        )
+        return None
+    if len(rts) == 1:
+        rt = rts[0]
+    else:
+        wanted = (args[0] if args else "").lower()
+        rt = next((r for r in rts if wanted in (r.account.id.lower(),
+                                                r.account.title.lower())), None)
+        if rt is None:
+            names = ", ".join(f"<code>{escape(r.account.id)}</code> ({escape(r.account.title)})"
+                              for r in rts)
+            await message.reply_text(
+                f"В группе несколько аккаунтов MAX — укажите первым аргументом: {names}",
+                parse_mode="HTML",
+            )
+            return None
+        args = args[1:]
+    return rt.topic_store, rt.client, rt.group_id, rt.sender.title_prefix, args
+
+
 def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE,
                           message=None):
     """Common prelude for topic handlers. Returns (message, max_chat_id, max_client)
@@ -121,14 +190,12 @@ def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE,
     thread_id = message.message_thread_id
     if thread_id is None or not message.is_topic_message:
         return None
-    topic_store: TopicStore | None = context.bot_data.get(TOPIC_STORE_KEY)
+    topic_store, max_client = _topic_context(context, message.chat_id, thread_id)
     max_chat_id = topic_store.chat_for_topic(thread_id) if topic_store else None
     if max_chat_id is None:
         return None
-    allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
-    if allowed_user_id and update.effective_user and update.effective_user.id != allowed_user_id:
+    if not _is_allowed(update, context):
         return None
-    max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     return message, max_chat_id, max_client
 
 
@@ -183,6 +250,8 @@ async def _surface_send_result(message, resp) -> None:
 
 async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route a text message typed in a forum topic back to the matching Max chat."""
+    if not _replies_enabled(context):
+        return
     target = _resolve_topic_target(update, context)
     if not target:
         return
@@ -280,6 +349,8 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Route a media message (photo / voice / document / audio / video) from a
     forum topic to the matching Max chat. Caption, if any, becomes the
     accompanying text."""
+    if not _replies_enabled(context):
+        return
     target = _resolve_topic_target(update, context)
     if not target:
         return
@@ -551,11 +622,13 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None:
         return
 
-    allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
-    if allowed_user_id and update.effective_user and update.effective_user.id != allowed_user_id:
+    if not _is_allowed(update, context):
         return
 
-    args = context.args or []
+    target = await _group_target(update, context, list(context.args or []))
+    if target is None:
+        return
+    topic_store, max_client, supergroup_id, title_prefix, args = target
     if not args:
         await message.reply_text(
             "Использование: <code>/bind &lt;chat_id или https://web.max.ru/-...&gt; "
@@ -572,7 +645,6 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     existing = topic_store.get_topic(max_chat_id)
     if existing is not None:
         await message.reply_text(
@@ -581,7 +653,6 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    max_client: MaxClient = context.bot_data[MAX_CLIENT_KEY]
     resolver = getattr(max_client, "resolver", None)
 
     # Build a topic title: explicit second arg → known chat title → chat id.
@@ -591,9 +662,8 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         title = resolver.chat_name(max_chat_id)
     else:
         title = str(max_chat_id)
-    title = title[:128]
+    title = (title_prefix + title)[:128]
 
-    supergroup_id = context.bot_data[SUPERGROUP_KEY]
     try:
         topic = await context.bot.create_forum_topic(
             chat_id=int(supergroup_id), name=title,
@@ -611,7 +681,6 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="HTML",
     )
     # Post & pin a profile card in the freshly-created topic.
-    supergroup_id = context.bot_data[SUPERGROUP_KEY]
     asyncio.create_task(
         post_topic_intro(context.bot, supergroup_id, max_client,
                           max_chat_id, thread_id)
@@ -658,11 +727,13 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None:
         return
 
-    allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
-    if allowed_user_id and update.effective_user and update.effective_user.id != allowed_user_id:
+    if not _is_allowed(update, context):
         return
 
-    args = context.args or []
+    target = await _group_target(update, context, list(context.args or []))
+    if target is None:
+        return
+    topic_store, max_client, supergroup_id, title_prefix, args = target
     link = args[0] if args else ""
     # Try to extract a max.ru link from anywhere in the message text too,
     # so `/add` works if the link was just pasted alongside the command.
@@ -679,7 +750,6 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    max_client: MaxClient = context.bot_data[MAX_CLIENT_KEY]
     try:
         resp = await max_client.open_by_link(link)
     except Exception as exc:
@@ -717,7 +787,6 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if chat_obj.get("title"):
             resolver.chats[chat_id] = chat_obj["title"]
 
-    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     existing = topic_store.get_topic(chat_id)
     if existing is not None:
         await message.reply_text(
@@ -741,9 +810,8 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 title = resolver.user_name(peer_id)
     if not title or title == str(chat_id):
         title = str(chat_id)
-    title = title[:128]
+    title = (title_prefix + title)[:128]
 
-    supergroup_id = context.bot_data[SUPERGROUP_KEY]
     try:
         topic = await context.bot.create_forum_topic(
             chat_id=int(supergroup_id), name=title,
@@ -808,8 +876,7 @@ async def _cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None:
         return
 
-    allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
-    if allowed_user_id and update.effective_user and update.effective_user.id != allowed_user_id:
+    if not _is_allowed(update, context):
         return
 
     target = _resolve_topic_target(update, context)
@@ -844,8 +911,7 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await query.answer()
 
-    allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
-    if allowed_user_id and update.effective_user and update.effective_user.id != allowed_user_id:
+    if not _is_allowed(update, context):
         return
 
     parts = query.data.split(":")
@@ -867,8 +933,14 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except ValueError:
         max_chat_id = parts[3]
 
-    supergroup_id = context.bot_data[SUPERGROUP_KEY]
-    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+    supergroup_id = query.message.chat_id if query.message else context.bot_data.get(SUPERGROUP_KEY)
+    topic_store, _ = _topic_context(context, supergroup_id, thread_id)
+    if topic_store is None:
+        try:
+            await query.edit_message_text("Этот топик уже не связан с MAX.")
+        except Exception:
+            pass
+        return
 
     # Remove mapping first — even if delete_forum_topic fails the stale link
     # is gone, and a fresh topic can be made via /bind.
@@ -913,9 +985,8 @@ async def _cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not max_client:
         await message.reply_text("⚠️ Max клиент не подключён.")
         return
-    supergroup_id = context.bot_data[SUPERGROUP_KEY]
     await post_topic_intro(
-        context.bot, supergroup_id, max_client, max_chat_id,
+        context.bot, message.chat_id, max_client, max_chat_id,
         message.message_thread_id,
     )
 
@@ -1042,20 +1113,15 @@ async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await message.reply_text(body, parse_mode="HTML")
 
 
-def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
-                 topic_store: TopicStore, allowed_user_id: int | None = None,
-                 proxy_url: str | None = None) -> Application:
-    """Build the Telegram Application that routes topic replies back to Max."""
+def _new_app(token: str, proxy_url: str | None) -> Application:
     builder = Application.builder().token(token)
     if proxy_url:
         builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
-    app = builder.build()
-    app.bot_data[MAX_CLIENT_KEY] = max_client
-    app.bot_data[TOPIC_STORE_KEY] = topic_store
-    app.bot_data[ALLOWED_USER_KEY] = int(allowed_user_id) if allowed_user_id else None
-    app.bot_data[SUPERGROUP_KEY] = int(supergroup_id)
+    return builder.build()
 
-    chat_filter = filters.Chat(chat_id=int(supergroup_id))
+
+def register_topic_handlers(app: Application, chat_filter) -> None:
+    """Group-side handlers: commands and TG → MAX routing in forum topics."""
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))
     app.add_handler(CommandHandler("add", _cmd_add, filters=chat_filter))
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))
@@ -1089,4 +1155,28 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
         )
     )
 
+
+def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
+                 topic_store: TopicStore, allowed_user_id: int | None = None,
+                 proxy_url: str | None = None) -> Application:
+    """Single-account Application bound to one supergroup (tests / embedding).
+    The service itself runs multi-account via ``build_bridge_app``."""
+    app = _new_app(token, proxy_url)
+    app.bot_data[MAX_CLIENT_KEY] = max_client
+    app.bot_data[TOPIC_STORE_KEY] = topic_store
+    app.bot_data[ALLOWED_USER_KEY] = int(allowed_user_id) if allowed_user_id else None
+    app.bot_data[SUPERGROUP_KEY] = int(supergroup_id)
+    register_topic_handlers(app, filters.Chat(chat_id=int(supergroup_id)))
+    return app
+
+
+def build_bridge_app(token: str, proxy_url: str | None = None) -> Application:
+    """Multi-account Application: any supergroup (routing by group + topic via
+    the Bridge in ``bot_data[REGISTRY_KEY]``) plus the private-chat setup
+    dialog. The caller puts the Bridge into bot_data before polling."""
+    from app.setup_bot import register_setup_handlers
+
+    app = _new_app(token, proxy_url)
+    register_setup_handlers(app)
+    register_topic_handlers(app, filters.ChatType.SUPERGROUP)
     return app

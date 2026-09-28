@@ -45,12 +45,11 @@ class TestSettingsDataclass:
             s.max_token = "changed"  # type: ignore[misc]
 
     def test_defaults(self):
-        s = Settings(
-            max_token="t", max_device_id="d", tg_bot_token="b", tg_chat_id="c"
-        )
+        s = Settings(tg_bot_token="b")
         assert s.debug is False
-        assert s.reply_enabled is False
+        assert s.reply_enabled is True
         assert s.max_chat_ids is None
+        assert s.max_token is None and s.tg_chat_id is None
 
 
 # ---------------------------------------------------------------------------
@@ -97,9 +96,9 @@ class TestLoadSettingsValid:
         s = _load_settings_with_env(_env(DEBUG="no"))
         assert s.debug is False
 
-    def test_reply_enabled_default_false(self):
+    def test_reply_enabled_default_true(self):
         s = _load_settings_with_env(_env())
-        assert s.reply_enabled is False
+        assert s.reply_enabled is True
 
     def test_reply_enabled_true_via_1(self):
         s = _load_settings_with_env(_env(REPLY_ENABLED="1"))
@@ -134,53 +133,40 @@ class TestLoadSettingsValid:
 # load_settings — missing required variables
 # ---------------------------------------------------------------------------
 
-class TestLoadSettingsMissing:
-    def _env_without(self, *keys):
-        e = dict(_VALID_ENV)
-        for k in keys:
-            e.pop(k, None)
-        return e
+class TestLoadSettingsMinimal:
+    """Only TG_BOT_TOKEN is required; MAX accounts are set up in the bot chat."""
 
-    def test_missing_max_token_raises(self):
-        with pytest.raises(SystemExit) as exc:
-            _load_settings_with_env(self._env_without("MAX_TOKEN"))
-        assert "MAX_TOKEN" in str(exc.value)
-
-    def test_missing_max_device_id_raises(self):
-        with pytest.raises(SystemExit) as exc:
-            _load_settings_with_env(self._env_without("MAX_DEVICE_ID"))
-        assert "MAX_DEVICE_ID" in str(exc.value)
+    def test_only_bot_token(self):
+        s = _load_settings_with_env({"TG_BOT_TOKEN": "1:x"})
+        assert s.tg_bot_token == "1:x"
+        assert s.max_token is None and s.max_device_id is None
+        assert s.tg_chat_id is None and s.tg_allowed_user_id is None
 
     def test_missing_tg_bot_token_raises(self):
         with pytest.raises(SystemExit) as exc:
-            _load_settings_with_env(self._env_without("TG_BOT_TOKEN"))
+            _load_settings_with_env({})
         assert "TG_BOT_TOKEN" in str(exc.value)
 
-    def test_missing_tg_chat_id_raises(self):
-        with pytest.raises(SystemExit) as exc:
-            _load_settings_with_env(self._env_without("TG_CHAT_ID"))
-        assert "TG_CHAT_ID" in str(exc.value)
+    def test_empty_bot_token_raises(self):
+        with pytest.raises(SystemExit):
+            _load_settings_with_env({"TG_BOT_TOKEN": ""})
 
-    def test_missing_multiple_vars_reports_all(self):
-        missing = ["MAX_TOKEN", "TG_BOT_TOKEN"]
+    def test_max_token_without_device_id_raises(self):
         with pytest.raises(SystemExit) as exc:
-            _load_settings_with_env(self._env_without(*missing))
-        msg = str(exc.value)
-        for var in missing:
-            assert var in msg
+            _load_settings_with_env({"TG_BOT_TOKEN": "1:x", "MAX_TOKEN": "t"})
+        assert "MAX_DEVICE_ID" in str(exc.value)
 
-    def test_completely_empty_env_reports_all_required(self):
-        required = ["MAX_TOKEN", "MAX_DEVICE_ID", "TG_BOT_TOKEN", "TG_CHAT_ID"]
-        with pytest.raises(SystemExit) as exc:
-            _load_settings_with_env({})
-        msg = str(exc.value)
-        for var in required:
-            assert var in msg
+    def test_invalid_chat_id_raises(self):
+        with pytest.raises(SystemExit):
+            _load_settings_with_env({"TG_BOT_TOKEN": "1:x", "TG_CHAT_ID": "abc"})
 
-    def test_empty_string_value_treated_as_missing(self):
-        with pytest.raises(SystemExit) as exc:
-            _load_settings_with_env(_env(MAX_TOKEN=""))
-        assert "MAX_TOKEN" in str(exc.value)
+    def test_invalid_allowed_user_raises(self):
+        with pytest.raises(SystemExit):
+            _load_settings_with_env({"TG_BOT_TOKEN": "1:x", "TG_ALLOWED_USER_ID": "me"})
+
+    def test_allowed_user_parsed(self):
+        s = _load_settings_with_env({"TG_BOT_TOKEN": "1:x", "TG_ALLOWED_USER_ID": "42"})
+        assert s.tg_allowed_user_id == 42
 
 
 def test_max_proxy_optional():

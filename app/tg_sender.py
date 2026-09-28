@@ -107,17 +107,27 @@ def _is_topic_gone(err: Exception) -> bool:
 def _looks_numeric(title: str) -> bool:
     """A title is 'placeholder' when it carries no human-readable name yet."""
     title = (title or "").strip()
+    if " · " in title:           # "<account> · <name>" in shared groups
+        title = title.split(" · ", 1)[1].strip()
     return not title or title.isdigit() or title.startswith("DM:")
 
 
 class TelegramSender:
     def __init__(self, token: str, chat_id: str, topic_store: TopicStore,
-                 proxy_url: str | None = None):
-        if proxy_url:
+                 proxy_url: str | None = None, bot: Bot | None = None,
+                 title_prefix: str = ""):
+        # A shared bot (the Application's) is owned by the caller: start()/stop()
+        # then leave its lifecycle alone.
+        self._owns_bot = bot is None
+        if bot is not None:
+            self._bot = bot
+        elif proxy_url:
             request = HTTPXRequest(proxy=proxy_url)
             self._bot = Bot(token=token, request=request)
         else:
             self._bot = Bot(token=token)
+        # Prepended to new topic names when several MAX accounts share a group.
+        self.title_prefix = title_prefix
         self._chat_id = chat_id
         self._topics = topic_store
         self._topic_lock = asyncio.Lock()
@@ -139,12 +149,15 @@ class TelegramSender:
         return self._topics
 
     async def start(self):
+        if not self._owns_bot:
+            return
         await self._bot.initialize()
         me = await self._bot.get_me()
         log.info("Telegram bot ready: @%s", me.username)
 
     async def stop(self):
-        await self._bot.shutdown()
+        if self._owns_bot:
+            await self._bot.shutdown()
 
     # ── forum topics ───────────────────────────────────────────────
 
@@ -156,7 +169,10 @@ class TelegramSender:
         the topic is renamed. Returns None if topic creation fails — callers
         then fall back to the General topic.
         """
-        title = (title or str(max_chat_id)).strip()[:TG_TOPIC_NAME_MAX]
+        title = (title or str(max_chat_id)).strip()
+        if self.title_prefix:
+            title = f"{self.title_prefix}{title}"
+        title = title[:TG_TOPIC_NAME_MAX]
 
         existing = self._topics.get_topic(max_chat_id)
         if existing is not None:

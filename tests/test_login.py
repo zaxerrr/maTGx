@@ -107,3 +107,60 @@ class TestFlow:
     async def test_missing_login_token_is_explained(self, monkeypatch, tmp_path):
         with pytest.raises(LoginError, match="облачный пароль"):
             await self._run(monkeypatch, tmp_path, {"check": {"passwordChallenge": {}}}, ["123456"])
+
+
+class TestPhoneLoginClass:
+    async def test_two_step_login(self, monkeypatch):
+        runner, url, seen = await _fake_max({})
+        monkeypatch.setattr(login.MaxClient, "WS_URL", url)
+        try:
+            pl = login.PhoneLogin()
+            assert await pl.start("8 999 123 45 67") == "+79991234567"
+            with pytest.raises(login.CodeRejected):
+                await pl.finish("000000")
+            token, device, profile = await pl.finish("12 34 56")
+        finally:
+            await runner.cleanup()
+        assert token == "LOGIN-TOK" and device == pl.device_id
+        assert profile["id"] == 5
+        assert [p["payload"]["deviceId"] for p in seen if p["opcode"] == 6] == [device, device]
+
+    async def test_keepalive_pings_while_waiting(self, monkeypatch):
+        runner, url, seen = await _fake_max({})
+        monkeypatch.setattr(login.MaxClient, "WS_URL", url)
+        monkeypatch.setattr(login.PhoneLogin, "KEEPALIVE_SEC", 0.05)
+        try:
+            pl = login.PhoneLogin()
+            await pl.start("+79991234567")
+            import asyncio
+            await asyncio.sleep(0.2)
+            await pl.close()
+        finally:
+            await runner.cleanup()
+        assert any(p["opcode"] == 1 for p in seen)
+
+    async def test_check_token_rejected(self, monkeypatch):
+        async def handler(req):
+            ws = web.WebSocketResponse()
+            await ws.prepare(req)
+            async for m in ws:
+                p = json.loads(m.data)
+                if p["opcode"] == 6:
+                    out, cmd = {}, 1
+                else:
+                    out, cmd = {"error": "login.token", "message": "Invalid token"}, 3
+                await ws.send_str(json.dumps({"cmd": cmd, "seq": p["seq"], "opcode": p["opcode"], "payload": out}))
+            return ws
+        app = web.Application()
+        app.router.add_get("/ws", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        monkeypatch.setattr(login.MaxClient, "WS_URL",
+                            f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}/ws")
+        try:
+            with pytest.raises(LoginError, match="Invalid token"):
+                await login.check_token("bad", "dev")
+        finally:
+            await runner.cleanup()
