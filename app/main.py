@@ -78,6 +78,8 @@ async def main():
 
     if settings.tg_proxy:
         log.info("Using Telegram proxy: %s", settings.tg_proxy.split("@")[-1])
+    if settings.max_proxy:
+        log.info("Using MAX proxy: %s", settings.max_proxy.split("@")[-1])
 
     os.makedirs(settings.state_dir, exist_ok=True)
     topic_store = TopicStore(os.path.join(settings.state_dir, "topics.json"))
@@ -89,7 +91,7 @@ async def main():
 
     client = create_max_client(
         settings.max_token, settings.max_device_id, sender, settings.max_chat_ids,
-        debug=settings.debug, msgmap=msgmap,
+        debug=settings.debug, msgmap=msgmap, proxy=settings.max_proxy,
     )
 
     tg_app = None

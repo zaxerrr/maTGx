@@ -181,3 +181,9 @@ class TestLoadSettingsMissing:
         with pytest.raises(SystemExit) as exc:
             _load_settings_with_env(_env(MAX_TOKEN=""))
         assert "MAX_TOKEN" in str(exc.value)
+
+
+def test_max_proxy_optional():
+    assert _load_settings_with_env(_env()).max_proxy is None
+    s = _load_settings_with_env(_env(MAX_PROXY="http://u:p@h:3128"))
+    assert s.max_proxy == "http://u:p@h:3128"

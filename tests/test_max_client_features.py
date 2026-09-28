@@ -164,3 +164,8 @@ class TestSizeCappedDownload:
             assert await c.download_file(url, max_bytes=1000) is None
         finally:
             await runner.cleanup()
+
+
+def test_proxy_passed_to_client():
+    assert MaxClient(token="t", device_id="d").proxy is None
+    assert MaxClient(token="t", device_id="d", proxy="http://p:1").proxy == "http://p:1"

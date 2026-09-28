@@ -12,6 +12,7 @@ class Settings:
     tg_chat_id: str
     max_chat_ids: str | None = None
     tg_proxy: str | None = None
+    max_proxy: str | None = None
     debug: bool = False
     reply_enabled: bool = False
     state_dir: str = "state"
@@ -55,6 +56,7 @@ def load_settings() -> Settings:
         tg_chat_id=tg_chat_id,
         max_chat_ids=os.environ.get("MAX_CHAT_IDS") or None,
         tg_proxy=os.environ.get("TG_PROXY") or None,
+        max_proxy=os.environ.get("MAX_PROXY") or None,
         debug=os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"),
         reply_enabled=os.environ.get("REPLY_ENABLED", "").lower() in ("1", "true", "yes"),
         state_dir=os.environ.get("STATE_DIR") or "state",

@@ -115,10 +115,14 @@ class MaxClient:
     RECONNECT_SEC = 5
     MAX_RECONNECT_SEC = 300    # backoff cap while the connection keeps failing
 
-    def __init__(self, token: str, device_id: str, chat_ids: str | None = None, debug: bool = False):
+    def __init__(self, token: str, device_id: str, chat_ids: str | None = None,
+                 debug: bool = False, proxy: str | None = None):
         self.token = token
         self.device_id = device_id
         self.debug = debug
+        # HTTP(S) proxy for the WebSocket and media up/downloads, e.g. a
+        # Russian exit for a server abroad. None = direct connection.
+        self.proxy = proxy
         self.chat_ids: list[int] = []
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._seq = 0
@@ -267,7 +271,7 @@ class MaxClient:
                 try:
                     log.info("Connecting to %s ...", self.WS_URL)
                     async with session.ws_connect(
-                        self.WS_URL, headers=_WS_HEADERS
+                        self.WS_URL, headers=_WS_HEADERS, proxy=self.proxy
                     ) as ws:
                         self._ws = ws
                         self._seq = 0
@@ -733,7 +737,7 @@ class MaxClient:
             form = aiohttp.FormData()
             form.add_field("file", data, filename=filename, content_type=mimetype)
             async with session.post(
-                url, headers=_HTTP_HEADERS, data=form,
+                url, headers=_HTTP_HEADERS, data=form, proxy=self.proxy,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status != 200:
@@ -770,7 +774,7 @@ class MaxClient:
             close_after = True
         try:
             async with session.get(
-                url, headers=_HTTP_HEADERS,
+                url, headers=_HTTP_HEADERS, proxy=self.proxy,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status == 200:
