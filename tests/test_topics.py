@@ -85,3 +85,12 @@ class TestPersistence:
 
         store = TopicStore(path)
         assert store.get_topic(42) is None
+
+
+def test_set_topic_replaces_reverse_mapping(tmp_path):
+    from app.topics import TopicStore
+    store = TopicStore(str(tmp_path / "t.json"))
+    store.set_topic(-7, 5, "Ann")
+    store.set_topic(-7, 9, "Ann")          # topic recreated
+    assert store.chat_for_topic(9) == -7
+    assert store.chat_for_topic(5) is None

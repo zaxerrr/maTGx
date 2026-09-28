@@ -3,7 +3,7 @@ import io
 import logging
 import re
 
-from telegram import Bot, InputFile
+from telegram import Bot, InputFile, ReplyParameters
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 TG_MAX_LENGTH = 4096
 TG_CAPTION_MAX = 1024
 TG_TOPIC_NAME_MAX = 128
+TG_UPLOAD_LIMIT = 50 * 1024 * 1024   # Bot API: max file a bot can send
 MAX_RETRIES = 3
 
 
@@ -94,6 +95,15 @@ def split_html(text: str, limit: int) -> list[str]:
     return chunks
 
 
+class _TopicGone(Exception):
+    """The forum topic a message was addressed to no longer exists."""
+
+
+def _is_topic_gone(err: Exception) -> bool:
+    text = str(err).lower()
+    return "thread not found" in text or "topic_deleted" in text or "topic deleted" in text
+
+
 def _looks_numeric(title: str) -> bool:
     """A title is 'placeholder' when it carries no human-readable name yet."""
     title = (title or "").strip()
@@ -111,6 +121,10 @@ class TelegramSender:
         self._chat_id = chat_id
         self._topics = topic_store
         self._topic_lock = asyncio.Lock()
+        self._moved: dict[int, int] = {}   # deleted thread id → recreated one
+        # async (max_chat_id, thread_id) -> None, set by the listener to post
+        # the intro card into a topic recreated after manual deletion.
+        self.on_topic_recreated = None
 
     @property
     def bot(self) -> Bot:
@@ -181,7 +195,7 @@ class TelegramSender:
 
     # ── helpers ────────────────────────────────────────────────────
 
-    async def _retry(self, coro_factory):
+    async def _retry(self, coro_factory, *, raise_topic_gone: bool = False):
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 return await coro_factory()
@@ -191,9 +205,11 @@ class TelegramSender:
             except TimedOut:
                 log.warning("Telegram timeout (attempt %d/%d)", attempt, MAX_RETRIES)
                 await asyncio.sleep(2 * attempt)
-            except BadRequest:
-                # Malformed request (bad HTML, missing topic, ...) — the same
-                # request will fail again, don't waste retries on it.
+            except BadRequest as e:
+                if raise_topic_gone and _is_topic_gone(e):
+                    raise _TopicGone() from e
+                # Malformed request (bad HTML, ...) — the same request will
+                # fail again, don't waste retries on it.
                 log.exception("Telegram rejected the request")
                 return None
             except Exception:
@@ -204,101 +220,206 @@ class TelegramSender:
         log.error("Giving up on Telegram request after %d attempts", MAX_RETRIES)
         return None
 
+    async def _deliver(self, build, message_thread_id: int | None,
+                       reply_to: int | None = None):
+        """Run ``build(thread_id, extra_kwargs)`` with retries.
+
+        If the forum topic was deleted by hand in Telegram, recreate it for
+        the same Max chat and send there instead of losing the message.
+        """
+        thread_id = self._moved.get(message_thread_id, message_thread_id)
+        extra = {}
+        if reply_to:
+            extra["reply_parameters"] = ReplyParameters(
+                message_id=reply_to, allow_sending_without_reply=True,
+            )
+        try:
+            return await self._retry(lambda: build(thread_id, extra),
+                                     raise_topic_gone=thread_id is not None)
+        except _TopicGone:
+            new_thread = await self._recreate_topic(thread_id)
+            if new_thread is None:
+                return None
+            # The reply target lived in the deleted topic.
+            return await self._retry(lambda: build(new_thread, {}))
+
+    async def _recreate_topic(self, old_thread_id: int) -> int | None:
+        max_chat_id = self._topics.chat_for_topic(old_thread_id)
+        if max_chat_id is None:
+            log.warning("Topic %s is gone and not linked to a Max chat", old_thread_id)
+            return None
+        async with self._topic_lock:
+            current = self._topics.get_topic(max_chat_id)
+            if current is not None and current != old_thread_id:
+                self._moved[old_thread_id] = current
+                return current  # someone else already recreated it
+            title = self._topics.get_title(max_chat_id) or str(max_chat_id)
+            try:
+                topic = await self._bot.create_forum_topic(chat_id=self._chat_id, name=title)
+            except Exception:
+                log.exception("Failed to recreate forum topic for Max chat %s", max_chat_id)
+                return None
+            new_thread = topic.message_thread_id
+            self._topics.set_topic(max_chat_id, new_thread, title)
+            self._moved[old_thread_id] = new_thread
+            log.warning("Forum topic %s was deleted — recreated as %s for Max chat %s",
+                        old_thread_id, new_thread, max_chat_id)
+        if self.on_topic_recreated:
+            try:
+                await self.on_topic_recreated(max_chat_id, new_thread)
+            except Exception:
+                log.exception("on_topic_recreated callback failed")
+        return new_thread
+
     async def _send_with_caption(self, send_fn, caption: str,
-                                 message_thread_id: int | None):
+                                 message_thread_id: int | None,
+                                 reply_to: int | None = None):
         """Send media whose caption may exceed Telegram's 1024 limit: the
         first part goes into the caption, the rest follows as text."""
         parts = split_html(caption, TG_CAPTION_MAX) if caption else [""]
-        result = await self._retry(lambda: send_fn(parts[0] or None))
+        result = await self._deliver(
+            lambda tid, extra: send_fn(parts[0] or None, tid, extra),
+            message_thread_id, reply_to,
+        )
         if result is not None and len(parts) > 1:
             await self.send("\n".join(parts[1:]), message_thread_id=message_thread_id)
         return result
 
     # ── send methods ───────────────────────────────────────────────
+    # Each returns the (first) sent telegram.Message, or None on failure.
 
-    async def send(self, text: str, message_thread_id: int | None = None) -> None:
+    async def send(self, text: str, message_thread_id: int | None = None,
+                   reply_to: int | None = None):
         if not text:
-            return
+            return None
 
-        for chunk in split_html(text, TG_MAX_LENGTH):
-            await self._retry(
-                lambda chunk=chunk: self._bot.send_message(
+        first = None
+        for i, chunk in enumerate(split_html(text, TG_MAX_LENGTH)):
+            sent = await self._deliver(
+                lambda tid, extra, chunk=chunk: self._bot.send_message(
                     chat_id=self._chat_id,
                     text=chunk,
                     parse_mode=ParseMode.HTML,
-                    message_thread_id=message_thread_id,
-                )
+                    message_thread_id=tid,
+                    **extra,
+                ),
+                message_thread_id, reply_to if i == 0 else None,
             )
+            if first is None:
+                first = sent
+        return first
 
     async def send_photo(self, data: bytes, caption: str = "", filename: str = "photo.jpg",
-                         message_thread_id: int | None = None) -> None:
-        await self._send_with_caption(
-            lambda cap: self._bot.send_photo(
+                         message_thread_id: int | None = None,
+                         reply_to: int | None = None):
+        return await self._send_with_caption(
+            lambda cap, tid, extra: self._bot.send_photo(
                 chat_id=self._chat_id,
                 photo=InputFile(io.BytesIO(data), filename=filename),
                 caption=cap,
                 parse_mode=ParseMode.HTML,
-                message_thread_id=message_thread_id,
+                message_thread_id=tid,
+                **extra,
             ),
-            caption, message_thread_id,
+            caption, message_thread_id, reply_to,
         )
 
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",
-                            message_thread_id: int | None = None) -> None:
-        await self._send_with_caption(
-            lambda cap: self._bot.send_document(
+                            message_thread_id: int | None = None,
+                            reply_to: int | None = None):
+        return await self._send_with_caption(
+            lambda cap, tid, extra: self._bot.send_document(
                 chat_id=self._chat_id,
                 document=InputFile(io.BytesIO(data), filename=filename),
                 caption=cap,
                 parse_mode=ParseMode.HTML,
-                message_thread_id=message_thread_id,
+                message_thread_id=tid,
+                **extra,
             ),
-            caption, message_thread_id,
+            caption, message_thread_id, reply_to,
         )
 
     async def send_video(self, data: bytes, caption: str = "", filename: str = "video.mp4",
-                         message_thread_id: int | None = None) -> None:
-        await self._send_with_caption(
-            lambda cap: self._bot.send_video(
+                         message_thread_id: int | None = None,
+                         reply_to: int | None = None):
+        return await self._send_with_caption(
+            lambda cap, tid, extra: self._bot.send_video(
                 chat_id=self._chat_id,
                 video=InputFile(io.BytesIO(data), filename=filename),
                 caption=cap,
                 parse_mode=ParseMode.HTML,
-                message_thread_id=message_thread_id,
+                message_thread_id=tid,
+                supports_streaming=True,
+                **extra,
             ),
-            caption, message_thread_id,
+            caption, message_thread_id, reply_to,
         )
 
     async def send_voice(self, data: bytes, caption: str = "",
-                         message_thread_id: int | None = None) -> None:
+                         message_thread_id: int | None = None,
+                         reply_to: int | None = None):
         result = await self._send_with_caption(
-            lambda cap: self._bot.send_voice(
+            lambda cap, tid, extra: self._bot.send_voice(
                 chat_id=self._chat_id,
                 voice=InputFile(io.BytesIO(data), filename="voice.ogg"),
                 caption=cap,
                 parse_mode=ParseMode.HTML,
-                message_thread_id=message_thread_id,
+                message_thread_id=tid,
+                **extra,
             ),
-            caption, message_thread_id,
+            caption, message_thread_id, reply_to,
         )
         if result is None:
             log.info("send_voice failed, falling back to send_audio")
-            await self._send_with_caption(
-                lambda cap: self._bot.send_audio(
+            result = await self._send_with_caption(
+                lambda cap, tid, extra: self._bot.send_audio(
                     chat_id=self._chat_id,
                     audio=InputFile(io.BytesIO(data), filename="audio.m4a"),
                     caption=cap,
                     parse_mode=ParseMode.HTML,
-                    message_thread_id=message_thread_id,
+                    message_thread_id=tid,
+                    **extra,
                 ),
-                caption, message_thread_id,
+                caption, message_thread_id, reply_to,
             )
+        return result
 
-    async def send_sticker(self, data: bytes, message_thread_id: int | None = None) -> None:
-        await self._retry(
-            lambda: self._bot.send_sticker(
+    async def send_sticker(self, data: bytes, message_thread_id: int | None = None,
+                           reply_to: int | None = None):
+        return await self._deliver(
+            lambda tid, extra: self._bot.send_sticker(
                 chat_id=self._chat_id,
                 sticker=InputFile(io.BytesIO(data), filename="sticker.webp"),
-                message_thread_id=message_thread_id,
-            )
+                message_thread_id=tid,
+                **extra,
+            ),
+            message_thread_id, reply_to,
         )
+
+    async def edit_text(self, message_id: int, html: str) -> bool:
+        """Replace the text (or caption, for media) of a bridged message."""
+        html = split_html(html, TG_MAX_LENGTH)[0]
+        try:
+            await self._bot.edit_message_text(
+                chat_id=self._chat_id, message_id=message_id,
+                text=html, parse_mode=ParseMode.HTML,
+            )
+            return True
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return True
+            if "no text" not in str(e).lower():
+                log.warning("edit_message_text(%s) failed: %s", message_id, e)
+                return False
+        except Exception:
+            log.exception("edit_message_text(%s) failed", message_id)
+            return False
+        try:
+            await self._bot.edit_message_caption(
+                chat_id=self._chat_id, message_id=message_id,
+                caption=split_html(html, TG_CAPTION_MAX)[0], parse_mode=ParseMode.HTML,
+            )
+            return True
+        except Exception:
+            log.exception("edit_message_caption(%s) failed", message_id)
+            return False

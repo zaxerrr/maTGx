@@ -9,8 +9,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --progress-bar off -r requirements.txt
+RUN pip install --no-cache-dir --progress-bar off -r requirements.txt \
+    && useradd --system --uid 10001 --home-dir /app --shell /usr/sbin/nologin app
 
 COPY . .
+RUN chmod +x /app/docker-entrypoint.sh
 
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["python", "-m", "app.main"]

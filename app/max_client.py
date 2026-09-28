@@ -71,9 +71,13 @@ class OpCode(IntEnum):
     SEND_MESSAGE = 64
     ATTACH_TYPING = 65        # "I'm uploading <type> in this chat"
     EDIT_MESSAGE = 67
+    DELETE_MESSAGE = 66
     PHOTO_UPLOAD_URL = 80     # get URL for photo upload
+    VIDEO_UPLOAD_URL = 82     # get URL for video upload
+    VIDEO_DOWNLOAD_URL = 83   # resolve playable URLs of an incoming video
     AUDIO_UPLOAD_URL = 86     # get URL for voice/audio upload (experimental)
     FILE_UPLOAD_URL = 87      # get URL for file upload
+    FILE_DOWNLOAD_URL = 88    # resolve download URL of an incoming file
     DISPATCH = 128
     UPLOAD_READY = 136        # server says an uploaded file/video is processed
 
@@ -88,6 +92,7 @@ class MaxMessage:
     is_self: bool = False
     attaches: list = field(default_factory=list)
     link: dict = field(default_factory=dict)
+    elements: list = field(default_factory=list)   # text formatting ranges
     raw: dict = field(default_factory=dict)
 
 
@@ -125,6 +130,7 @@ class MaxClient:
         self._dispatch_counter = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._file_pending: dict[int, asyncio.Future] = {}
+        self._video_pending: dict[int, asyncio.Future] = {}
         self._on_disconnect_cb = None
         self._on_auth_failed_cb = None
         self._authorized = False
@@ -287,7 +293,12 @@ class MaxClient:
 
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                await self._handle(json.loads(msg.data))
+                                try:
+                                    data = json.loads(msg.data)
+                                except ValueError:
+                                    log.warning("Undecodable packet from MAX: %.200s", msg.data)
+                                    continue
+                                await self._handle(data)
                             elif msg.type in (
                                 aiohttp.WSMsgType.CLOSED,
                                 aiohttp.WSMsgType.ERROR,
@@ -403,11 +414,13 @@ class MaxClient:
 
             elif op == OpCode.UPLOAD_READY:
                 # Server confirms an uploaded file/video finished server-side processing.
-                file_id = payload.get("fileId")
-                if file_id is not None:
-                    fut = self._file_pending.pop(int(file_id), None)
-                    if fut and not fut.done():
-                        fut.set_result(payload)
+                fut = None
+                if payload.get("videoId") is not None:
+                    fut = self._video_pending.pop(int(payload["videoId"]), None)
+                elif payload.get("fileId") is not None:
+                    fut = self._file_pending.pop(int(payload["fileId"]), None)
+                if fut and not fut.done():
+                    fut.set_result(payload)
                 log.debug("UPLOAD_READY op=136: %s", payload)
 
             elif op in (OpCode.HEARTBEAT_PING,):
@@ -429,12 +442,13 @@ class MaxClient:
         return resp
 
     async def send_message(self, chat_id, text: str = "", elements=None,
-                            attaches=None) -> dict:
+                            attaches=None, reply_to=None) -> dict:
         """Send a message to a Max chat. Returns the server response.
 
         Both ``elements`` (text formatting) and ``attaches`` (photos, files,
         voice, ...) are optional. Pass an empty ``text`` together with an
-        attach to send a media-only message.
+        attach to send a media-only message. ``reply_to`` is a Max message
+        id to reply to.
         """
         if elements is None:
             elements = []
@@ -444,6 +458,8 @@ class MaxClient:
         message = {"text": text, "cid": cid, "elements": elements}
         if attaches:
             message["attaches"] = attaches
+        if reply_to is not None:
+            message["link"] = {"type": "REPLY", "messageId": str(reply_to)}
         resp = await self.cmd(
             OpCode.SEND_MESSAGE,
             {
@@ -456,6 +472,86 @@ class MaxClient:
         log.info("send_message(chat=%s, attaches=%d) → %s",
                  chat_id, len(attaches), "OK" if ok else "FAIL")
         return resp
+
+    @staticmethod
+    def sent_message_id(resp: dict | None) -> str | None:
+        """Max message id from a SEND_MESSAGE response, if present."""
+        if not isinstance(resp, dict) or "_max_error" in resp:
+            return None
+        msg = resp.get("message")
+        if isinstance(msg, dict) and msg.get("id") is not None:
+            return str(msg["id"])
+        return None
+
+    async def edit_message(self, chat_id, message_id, text: str,
+                           elements=None) -> dict:
+        """Edit the text of a message we sent (opcode 67)."""
+        resp = await self.cmd(OpCode.EDIT_MESSAGE, {
+            "chatId": chat_id,
+            "messageId": str(message_id),
+            "text": text,
+            "elements": elements or [],
+            "attachments": [],
+        })
+        log.info("edit_message(chat=%s, msg=%s) → %s", chat_id, message_id,
+                 "OK" if resp and "_max_error" not in resp else "FAIL")
+        return resp
+
+    async def delete_messages(self, chat_id, message_ids: list,
+                              for_me: bool = False) -> dict:
+        """Delete messages (opcode 66). ``for_me=False`` deletes for everyone."""
+        resp = await self.cmd(OpCode.DELETE_MESSAGE, {
+            "chatId": chat_id,
+            "messageIds": [str(m) for m in message_ids],
+            "forMe": for_me,
+        })
+        log.info("delete_messages(chat=%s, %s) → %s", chat_id, message_ids,
+                 "OK" if resp and "_max_error" not in resp else "FAIL")
+        return resp
+
+    # ── media download (incoming) ──────────────────────────────────
+
+    async def video_download_url(self, video_id, chat_id, message_id) -> str | None:
+        """Resolve a playable MP4 URL for an incoming VIDEO attach (op 83).
+
+        The response maps quality keys (``MP4_720``, ``MP4_480``, ...) to
+        URLs, plus service keys like ``cache`` / ``EXTERNAL``.
+        """
+        resp = await self.cmd(OpCode.VIDEO_DOWNLOAD_URL, {
+            "videoId": video_id,
+            "chatId": chat_id,
+            "messageId": str(message_id),
+        })
+        if not resp or "_max_error" in resp:
+            log.warning("video_download_url failed: %s", str(resp)[:300])
+            return None
+        mp4 = {k: v for k, v in resp.items()
+               if isinstance(v, str) and v.startswith("http") and k.upper().startswith("MP4")}
+
+        def quality(key: str) -> int:
+            digits = "".join(ch for ch in key if ch.isdigit())
+            return int(digits) if digits else 0
+
+        # Highest quality first; the size limit is enforced on download.
+        for key in sorted(mp4, key=quality, reverse=True):
+            return mp4[key]
+        for v in resp.values():
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+        return None
+
+    async def file_download_url(self, file_id, chat_id, message_id) -> str | None:
+        """Resolve a download URL for an incoming FILE attach (op 88)."""
+        resp = await self.cmd(OpCode.FILE_DOWNLOAD_URL, {
+            "fileId": file_id,
+            "chatId": chat_id,
+            "messageId": str(message_id),
+        })
+        url = resp.get("url") if resp and "_max_error" not in resp else None
+        if not (isinstance(url, str) and url.startswith("http")):
+            log.warning("file_download_url failed: %s", str(resp)[:300])
+            return None
+        return url
 
     # ── media upload ───────────────────────────────────────────────
 
@@ -511,87 +607,6 @@ class MaxClient:
         log.info("open_by_link(%s) → %s",
                  link[:60], str(resp)[:300] if resp else resp)
         return resp
-
-    async def download_audio_url(self, audio_id, chat_id, message_id,
-                                  token: str | None = None) -> str | None:
-        """Resolve an audio attach reference into a downloadable URL.
-
-        Empirically: opcodes 84/85/89 in this range are routed to the calls
-        service or other unrelated subsystems and a single proto.payload
-        validation failure tears down the whole WebSocket. So instead of
-        blind opcode probing, try the same HTTP URL pattern that MAX uses
-        for incoming photos — both are tokenised through the same CDN
-        (i.oneme.ru) and the audio `token` happens to look like the `r`
-        parameter used in photo baseUrls.
-        """
-        if not token:
-            log.warning("download_audio_url: no token in attach")
-            return None
-
-        # Candidate URL templates, ordered by likelihood.
-        candidates = [
-            f"https://i.oneme.ru/i?r={token}",
-            f"https://i.oneme.ru/a?r={token}",
-            f"https://i.oneme.ru/audio?r={token}",
-            f"https://i.oneme.ru/?audioId={audio_id}&token={token}",
-        ]
-        log.info("download_audio_url: trying %d HTTP candidates", len(candidates))
-        for url in candidates:
-            ok = await self._probe_audio_url(url)
-            if ok:
-                log.info("download_audio_url: found audio at %s", url[:80])
-                return url
-
-        # Last cheap try: maybe the audio is stored in the same backend as
-        # regular files, so opcode 88 (file_download) with audioId-as-fileId
-        # could resolve. This opcode is well-known and won't tear down WS.
-        try:
-            audio_id_int = int(audio_id)
-        except (TypeError, ValueError):
-            audio_id_int = None
-        if audio_id_int is not None and chat_id is not None and message_id:
-            resp = await self.cmd(88, {
-                "fileId": audio_id_int,
-                "chatId": chat_id,
-                "messageId": str(message_id),
-            })
-            log.info("download_audio_url op=88(file-as-audio) → %s",
-                     str(resp)[:400] if resp else resp)
-            if resp and "_max_error" not in resp:
-                url = resp.get("url")
-                if isinstance(url, str) and url.startswith("http"):
-                    return url
-
-        log.warning("download_audio_url: nothing resolved an audio URL")
-        return None
-
-    async def _probe_audio_url(self, url: str) -> bool:
-        """HEAD-probe a candidate URL — accept if HTTP 200 with non-HTML body."""
-        session = getattr(self, "_session", None)
-        close_after = False
-        if session is None or session.closed:
-            session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
-            close_after = True
-        try:
-            async with session.get(
-                url, headers=_HTTP_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                ct = resp.headers.get("Content-Type", "")
-                log.info("probe %s → HTTP %d, Content-Type=%s",
-                          url[:80], resp.status, ct)
-                if resp.status != 200:
-                    return False
-                # Reject obviously-HTML responses (error/redirect pages).
-                if "text/html" in ct.lower():
-                    return False
-                return True
-        except Exception:
-            log.exception("probe error for %s", url[:80])
-            return False
-        finally:
-            if close_after:
-                await session.close()
 
     async def upload_audio(self, data: bytes, chat_id=None,
                             filename: str = "voice.ogg",
@@ -663,6 +678,47 @@ class MaxClient:
 
         return {"_type": attach_type, "fileId": file_id}
 
+    async def upload_video(self, data: bytes, chat_id=None,
+                           filename: str = "video.mp4",
+                           mimetype: str = "video/mp4",
+                           timeout: float = 120.0) -> dict | None:
+        """Upload a video as a native MAX video (opcode 82).
+
+        Like files, the server confirms processing with an UPLOAD_READY
+        (op 136) event carrying the ``videoId``.
+        """
+        resp = await self.cmd(OpCode.VIDEO_UPLOAD_URL, {"count": 1})
+        info_list = (resp or {}).get("info") or []
+        if not info_list or "_max_error" in resp:
+            log.error("Video upload URL request failed: %s", resp)
+            return None
+        info = info_list[0]
+        url, video_id, token = info.get("url"), info.get("videoId"), info.get("token")
+        if not url or video_id is None:
+            log.error("Video upload info missing url/videoId: %s", info)
+            return None
+
+        if chat_id is not None:
+            await self.cmd(OpCode.ATTACH_TYPING, {"chatId": chat_id, "type": "VIDEO"})
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._video_pending[int(video_id)] = fut
+        ok = await self._http_upload(url, data, filename, mimetype, expect_json=False)
+        if not ok:
+            self._video_pending.pop(int(video_id), None)
+            return None
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._video_pending.pop(int(video_id), None)
+            log.warning("Video processing timed out (videoId=%s)", video_id)
+            return None
+
+        attach = {"_type": "VIDEO", "videoId": video_id}
+        if token:
+            attach["token"] = token
+        return attach
+
     async def _http_upload(self, url: str, data: bytes, filename: str,
                             mimetype: str, expect_json: bool):
         """POST multipart bytes to an upload URL. Returns parsed JSON if
@@ -701,8 +757,12 @@ class MaxClient:
             if close_after:
                 await session.close()
 
-    async def download_file(self, url: str) -> bytes | None:
-        """Download a file by URL, returning raw bytes or None on failure."""
+    async def download_file(self, url: str, max_bytes: int | None = None) -> bytes | None:
+        """Download a file by URL, returning raw bytes or None on failure.
+
+        With ``max_bytes``, bail out (return None) as soon as the declared or
+        actual size exceeds it, instead of buffering a huge file in memory.
+        """
         session = getattr(self, "_session", None)
         close_after = False
         if session is None or session.closed:
@@ -714,7 +774,22 @@ class MaxClient:
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status == 200:
-                    data = await resp.read()
+                    if max_bytes is not None:
+                        declared = resp.content_length
+                        if declared is not None and declared > max_bytes:
+                            log.info("Skip download %s: %d bytes > limit %d",
+                                     url[:120], declared, max_bytes)
+                            return None
+                        buf = bytearray()
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            buf += chunk
+                            if len(buf) > max_bytes:
+                                log.info("Abort download %s: over limit %d",
+                                         url[:120], max_bytes)
+                                return None
+                        data = bytes(buf)
+                    else:
+                        data = await resp.read()
                     log.info("Downloaded %s (%d bytes)", url[:120], len(data))
                     return data
                 log.warning("Download failed %s — HTTP %d", url[:120], resp.status)
@@ -740,6 +815,7 @@ class MaxClient:
             message_id=str(msg_body.get("id", "")),
             attaches=msg_body.get("attaches") or [],
             link=msg_body.get("link") or {},
+            elements=msg_body.get("elements") or [],
             raw=payload,
         )
 

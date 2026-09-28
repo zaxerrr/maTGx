@@ -16,6 +16,7 @@ class Settings:
     reply_enabled: bool = False
     state_dir: str = "state"
     tg_allowed_user_id: int | None = None
+    sync_executor: bool = False
 
 
 def load_settings() -> Settings:
@@ -58,4 +59,5 @@ def load_settings() -> Settings:
         reply_enabled=os.environ.get("REPLY_ENABLED", "").lower() in ("1", "true", "yes"),
         state_dir=os.environ.get("STATE_DIR") or "state",
         tg_allowed_user_id=allowed_user_id,
+        sync_executor=os.environ.get("SYNC_EXECUTOR", "").lower() in ("1", "true", "yes"),
     )

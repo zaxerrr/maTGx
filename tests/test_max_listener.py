@@ -1,6 +1,5 @@
 """Tests for app/max_listener.py — pure helper functions."""
 
-import pytest
 from app.max_listener import _human_size, _guess_media_kind
 
 

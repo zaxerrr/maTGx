@@ -69,6 +69,9 @@ class TopicStore:
         return rec.get("title") if rec else None
 
     def set_topic(self, max_chat_id: Any, topic_id: int, title: str) -> None:
+        old = self._chats.get(str(max_chat_id))
+        if old and old.get("topic_id") is not None:
+            self._by_topic.pop(int(old["topic_id"]), None)
         self._chats[str(max_chat_id)] = {"topic_id": int(topic_id), "title": title}
         self._by_topic[int(topic_id)] = max_chat_id
         self._save()

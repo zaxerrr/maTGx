@@ -329,8 +329,6 @@ class TestResolveUser:
 
     @pytest.mark.asyncio
     async def test_populates_user_after_successful_fetch(self):
-        from unittest.mock import AsyncMock
-
         resolver = ContactResolver()
 
         async def fake_fetch(ids):

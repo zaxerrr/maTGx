@@ -1,6 +1,5 @@
 """Tests for disconnect notification throttling in app/max_listener.py."""
 
-import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
@@ -177,11 +176,28 @@ class TestReconnectNotification:
         snapshot = {"profile": {"id": 1, "names": []}, "chats": []}
         # First connect
         await client._on_ready_cb(snapshot)
-        # Reconnect
+        # Disconnect alert, then reconnect
+        await client._on_disconnect_cb()
         sender.send.reset_mock()
         await client._on_ready_cb(snapshot)
         sender.send.assert_called_once()
         assert "восстановлено" in sender.send.call_args[0][0]
+
+    async def test_no_restored_message_when_disconnect_alert_was_suppressed(self):
+        client, sender = _make_client()
+        snapshot = {"profile": {"id": 1, "names": []}, "chats": []}
+        t0 = datetime(2026, 4, 5, 10, 0, 0)
+        t1 = datetime(2026, 4, 5, 10, 5, 0)
+        with patch("app.max_listener.datetime") as mock_dt:
+            await client._on_ready_cb(snapshot)
+            mock_dt.now.return_value = t0
+            await client._on_disconnect_cb()          # alerted
+            await client._on_ready_cb(snapshot)       # "restored"
+            mock_dt.now.return_value = t1
+            await client._on_disconnect_cb()          # throttled
+            sender.send.reset_mock()
+            await client._on_ready_cb(snapshot)
+        sender.send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

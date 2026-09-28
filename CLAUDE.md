@@ -20,7 +20,8 @@ app/
   tg_sender.py     # TelegramSender + ensure_topic (create/rename)
   tg_handler.py    # TG → MAX handler + команды /bind, /add, /profile, /intro, /del, /help
   topics.py        # TopicStore: JSON-карта max_chat_id ↔ thread_id
-tests/             # 219 pytest, asyncio_mode=auto
+  msgmap.py        # MessageMap: SQLite tg_msg_id ↔ (max_chat_id, max_msg_id) + последний текст
+tests/             # 279 pytest, asyncio_mode=auto
 docs/cover.jpg     # обложка README
 state/             # runtime (топик-карта), gitignored
 logs/              # логи, gitignored
@@ -41,17 +42,18 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 | 35 | CONTACT_PRESENCE |
 | 48 | CHAT_GET |
 | 57 | open by link — работает только для `/join/<token>` (group/channel); `/u/<token>` падает с `not.found / chat namespace` |
-| 64 | SEND_MESSAGE (text, elements, attaches, link) |
+| 64 | SEND_MESSAGE (text, elements, attaches, link). Ответ: `link:{type:REPLY, messageId:"<id>"}`. В ответе сервера `message.id` — id отправленного |
+| 66 | DELETE_MESSAGE `{chatId, messageIds:[str], forMe}` |
 | 65 | ATTACH_TYPING ("я загружаю PHOTO/AUDIO/...") |
-| 67 | EDIT_MESSAGE |
+| 67 | EDIT_MESSAGE `{chatId, messageId:str, text, elements, attachments:[]}` |
 | 80 | PHOTO_UPLOAD_URL → `{count:1}` → `{url}` → POST → `{photos:{...:{token}}}` → attach `{_type:PHOTO, photoToken}` |
-| 82 | VIDEO_UPLOAD_URL |
-| 83 | VIDEO_DOWNLOAD_URL (на видео из MAX) |
+| 82 | VIDEO_UPLOAD_URL → `{count:1}` → `{info:[{url, videoId, token}]}` → POST → ждать `op=136` с `videoId` → attach `{_type:VIDEO, videoId, token}` |
+| 83 | VIDEO_DOWNLOAD_URL `{videoId, chatId, messageId}` → `{MP4_720: url, MP4_480: url, cache, EXTERNAL}` |
 | 84 | **CALLS** `createJoinLink` — НЕ аудио (как мы предполагали) |
 | 85 | **CALLS** `getOkCallData` — тоже не аудио |
 | 86 | Что-то с upload, требует `count + show + chatId`, возвращает `{}` |
 | 87 | FILE_UPLOAD_URL → `{count:1}` → `{info:[{url, fileId}]}` → POST → ждать DISPATCH `op=136` → attach `{_type:FILE, fileId}` |
-| 88 | FILE_DOWNLOAD_URL |
+| 88 | FILE_DOWNLOAD_URL `{fileId, chatId, messageId}` → `{url}` |
 | 128 | DISPATCH (incoming сообщения от MAX) |
 | 136 | UPLOAD_READY (server подтверждает обработку загруженного файла) |
 
@@ -97,39 +99,49 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 - `/add <https://max.ru/join/...>` — резолв инвайт-ссылки + создание топика. `/u/<token>` пока не поддерживается.
 - `/profile` — в топике, профиль собеседника (имя/id/аватар).
 - `/intro` — перепост закреплённой карточки.
+- `/rm` — ответом на своё сообщение: удалить его в MAX (op 66).
 - `/del` — удалить топик с подтверждением (inline-кнопки).
 - `/help` — справка.
 
 ## Состояние / runtime
 
 - `state/topics.json` — JSON-карта `max_chat_id ↔ {topic_id, title}`. Атомарно перезаписывается (tmpfile + os.replace). Critical для непересоздавания топиков. Том должен быть mounted в docker-compose.
+- `state/messages.db` — SQLite-карта сообщений для ответов/правок/`/rm`, хранит ~50k последних строк.
 - `logs/max2tg.log` — RotatingFileHandler 10MB × 5.
+
+## Поток сообщений (важные инварианты)
+
+- MAX → TG: `handle_message` держит `asyncio.Lock` на чат — сообщения одного чата обрабатываются строго по порядку, топик+интро создаются один раз.
+- Сообщение MAX с уже известным id = повторная доставка (текст тот же → пропуск) или правка (текст другой → `sender.edit_text`, иначе ответ «✏️ Изменено»).
+- Все `TelegramSender.send*` возвращают первое отправленное `Message` (или None) — это нужно для msgmap.
+- `TelegramSender._deliver` ловит BadRequest «thread not found» → пересоздаёт топик (`on_topic_recreated` постит интро) и шлёт туда.
+- Скачивание из MAX ограничено `TG_UPLOAD_LIMIT` (50 МБ); из TG — `TG_BOT_DOWNLOAD_LIMIT` (20 МБ).
 
 ## Тесты
 
-`pytest -q` → 219 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды + авторизация/watchdog/backoff, tg_sender split_html.
+`pytest -q` → 279 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды + авторизация/watchdog/backoff + edit/delete/video/file RPC, tg_sender (split_html, пересоздание топика, reply, edit), msgmap, сквозные потоки listener/handler.
 
 ## Деплой
 
-Docker. `docker-compose.yml` биндит `./logs:/app/logs` и `./state:/app/state`. Алёрт о подключении/обрыве идёт в General-топик.
+Docker. `docker-compose.yml` биндит `./logs:/app/logs` и `./state:/app/state`. `docker-entrypoint.sh` делает chown этих папок и запускает приложение от пользователя `app` (uid 10001) через `setpriv`. SIGTERM (`docker stop`) корректно гасит мост. Алёрт о подключении/обрыве идёт в General-топик.
 
 ## Что осталось / known issues
 
 - Голосовые TG → MAX: уходят как `.ogg` файл (FILE), не как voice bubble. Опкод нативной audio-upload неизвестен (issue в vkmax #14 — без ответа). Hunting requires browser-side network capture.
 - Voice MAX → TG: для нового `_type=UNSUPPORTED` нет рабочего download-опкода. Опкод 84/85 — calls service. Probing блокирован WS-disconnect на proto.payload.
 - `/u/<token>` (user share) — opcode 57 ищет в chat-namespace. Server hint «No link or token found» для `{token}` payload — обманчив, реально опкод хочет только `link` URL.
+- Удаление сообщений в MAX не зеркалится: событие удаления не найдено (смотреть `<<< EVENT` в логах). Правки MAX ловятся только если MAX повторно шлёт op=128 с тем же message id — не подтверждено на живом аккаунте.
 - Phone/about для контакта — `CONTACT_GET` не возвращает. Нужен другой опкод (предположительно тот же, что юзает web.max.ru при открытии профиля справа).
 
 ## Если нужно ребутнуть знание о репо
 
 ```bash
 # Локально
-cd /d/DevTools/Database/max2tg
 git status
 pytest -q
 
-# Прод (VPS Kyonix)
-ssh max2tg "cd /opt/max2tg && docker compose ps && docker compose logs --tail=50 max2tg"
+# Прод (путь по README — /opt/max2tg)
+cd /opt/max2tg && docker compose ps && docker compose logs --tail=50 max2tg
 
 # Структура развёртывания
 # - Контейнер max2tg-max2tg-1, образ собран из ./Dockerfile (один этап на python:3.12-slim; раньше копировали glibc-колёса в alpine — C-расширения aiohttp там не грузились).

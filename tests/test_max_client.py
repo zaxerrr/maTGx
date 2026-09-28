@@ -1,6 +1,5 @@
 """Tests for app/max_client.py — OpCode enum and _parse_message."""
 
-import pytest
 from app.max_client import MaxClient, MaxMessage, OpCode
 
 

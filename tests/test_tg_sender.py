@@ -75,12 +75,11 @@ class TestSplitHtml:
         assert all(_tg_len(c) <= TG_MAX_LENGTH for c in chunks)
 
 
-def _sender():
-    s = TelegramSender.__new__(TelegramSender)
+def _sender(topic_store=None):
+    s = TelegramSender("123:abc", "-100", topic_store or MagicMock())
     s._bot = MagicMock()
     s._bot.send_message = AsyncMock(return_value=MagicMock())
     s._bot.send_photo = AsyncMock(return_value=MagicMock())
-    s._chat_id = "-100"
     return s
 
 
@@ -112,3 +111,56 @@ class TestSend:
         s._bot.send_message = AsyncMock(side_effect=BadRequest("Can't parse entities"))
         await s.send("x")
         assert s._bot.send_message.await_count == 1
+
+
+class TestTopicRecreation:
+    async def test_deleted_topic_is_recreated_and_message_resent(self):
+        store = MagicMock()
+        store.chat_for_topic = MagicMock(return_value=-7)
+        store.get_topic = MagicMock(return_value=5)
+        store.get_title = MagicMock(return_value="Ann")
+        s = _sender(store)
+        s._bot.send_message = AsyncMock(side_effect=[
+            BadRequest("Message thread not found"), MagicMock(message_id=1)])
+        s._bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=9))
+        recreated = AsyncMock()
+        s.on_topic_recreated = recreated
+
+        await s.send("hi", message_thread_id=5)
+
+        s._bot.create_forum_topic.assert_awaited_once()
+        store.set_topic.assert_called_once_with(-7, 9, "Ann")
+        assert s._bot.send_message.await_args.kwargs["message_thread_id"] == 9
+        recreated.assert_awaited_once_with(-7, 9)
+
+        # Later sends to the old thread go straight to the new one.
+        s._bot.send_message = AsyncMock(return_value=MagicMock())
+        await s.send("again", message_thread_id=5)
+        assert s._bot.send_message.await_args.kwargs["message_thread_id"] == 9
+
+    async def test_reply_parameters_passed(self):
+        s = _sender()
+        await s.send("hi", message_thread_id=5, reply_to=42)
+        rp = s._bot.send_message.await_args.kwargs["reply_parameters"]
+        assert rp.message_id == 42 and rp.allow_sending_without_reply
+
+    async def test_send_returns_first_message(self):
+        s = _sender()
+        first = MagicMock(message_id=1)
+        s._bot.send_message = AsyncMock(side_effect=[first, MagicMock(message_id=2)])
+        assert await s.send("word " * 1000) is first
+
+
+class TestEditText:
+    async def test_edits_text(self):
+        s = _sender()
+        s._bot.edit_message_text = AsyncMock()
+        assert await s.edit_text(5, "<b>x</b>") is True
+
+    async def test_falls_back_to_caption_for_media(self):
+        s = _sender()
+        s._bot.edit_message_text = AsyncMock(
+            side_effect=BadRequest("There is no text in the message to edit"))
+        s._bot.edit_message_caption = AsyncMock()
+        assert await s.edit_text(5, "x") is True
+        s._bot.edit_message_caption.assert_awaited_once()

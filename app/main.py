@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
@@ -10,6 +11,7 @@ from telegram import Update
 
 from app.config import load_settings
 from app.max_listener import create_max_client
+from app.msgmap import MessageMap
 from app.tg_handler import build_tg_app
 from app.tg_sender import TelegramSender
 from app.topics import TopicStore
@@ -24,9 +26,10 @@ class _SyncExecutor(ThreadPoolExecutor):
 
     Python 3.12 requires set_default_executor() to receive a ThreadPoolExecutor,
     so we subclass it and override submit() to bypass _adjust_thread_count().
-    Used on low-resource servers where the OS cannot create new threads.
-    DNS resolution (getaddrinfo) will block the event loop for a few ms,
-    which is acceptable for a single-user forwarding bot.
+    Opt-in (SYNC_EXECUTOR=true) for low-resource servers where the OS cannot
+    create new threads. DNS resolution (getaddrinfo) then runs on the event
+    loop and a slow resolver stalls the whole bridge, heartbeats included —
+    so it is off by default.
     """
 
     def submit(self, fn, /, *args, **kwargs):
@@ -39,10 +42,13 @@ class _SyncExecutor(ThreadPoolExecutor):
 
 
 async def main():
-    loop = asyncio.get_running_loop()
-    loop.set_default_executor(_SyncExecutor())
-
     settings = load_settings()
+
+    loop = asyncio.get_running_loop()
+    if settings.sync_executor:
+        loop.set_default_executor(_SyncExecutor())
+    else:
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=4))
 
     level = logging.DEBUG if settings.debug else logging.INFO
     fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -67,12 +73,15 @@ async def main():
     logging.getLogger("telegram").setLevel(logging.WARNING if not settings.debug else logging.DEBUG)
 
     log.info("Debug mode: %s", "ON" if settings.debug else "OFF")
+    if settings.sync_executor:
+        log.info("SYNC_EXECUTOR on: blocking calls run on the event loop")
 
     if settings.tg_proxy:
         log.info("Using Telegram proxy: %s", settings.tg_proxy.split("@")[-1])
 
     os.makedirs(settings.state_dir, exist_ok=True)
     topic_store = TopicStore(os.path.join(settings.state_dir, "topics.json"))
+    msgmap = MessageMap(os.path.join(settings.state_dir, "messages.db"))
 
     sender = TelegramSender(settings.tg_bot_token, settings.tg_chat_id, topic_store,
                             proxy_url=settings.tg_proxy)
@@ -80,7 +89,7 @@ async def main():
 
     client = create_max_client(
         settings.max_token, settings.max_device_id, sender, settings.max_chat_ids,
-        debug=settings.debug,
+        debug=settings.debug, msgmap=msgmap,
     )
 
     tg_app = None
@@ -113,14 +122,23 @@ async def main():
             await tg_app.stop()
             await tg_app.shutdown()
         await sender.stop()
+        msgmap.close()
 
 
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    main_task = loop.create_task(main())
+    # `docker stop` sends SIGTERM: cancel main() so its finally-block closes
+    # Telegram polling, the bot session and the message DB cleanly.
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, main_task.cancel)
+        except (NotImplementedError, RuntimeError):
+            pass  # e.g. Windows
     try:
-        loop.run_until_complete(main())
-    except KeyboardInterrupt:
+        loop.run_until_complete(main_task)
+    except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Stopped.")
     finally:
         try:

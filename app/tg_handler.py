@@ -25,6 +25,8 @@ TOPIC_STORE_KEY = "topic_store"
 ALLOWED_USER_KEY = "allowed_user_id"
 SUPERGROUP_KEY = "supergroup_id"
 
+TG_BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024   # Bot API getFile limit
+
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
 
 # Telegram entity type → MAX element type. The MAX names match what the
@@ -109,10 +111,11 @@ def _peer_id_in_dm(resolver, chat_id) -> int | None:
     return None
 
 
-def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          message=None):
     """Common prelude for topic handlers. Returns (message, max_chat_id, max_client)
     if the message should be routed, or None to drop silently."""
-    message = update.message
+    message = message or update.message
     if message is None:
         return None
     thread_id = message.message_thread_id
@@ -127,6 +130,38 @@ def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return None
     max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     return message, max_chat_id, max_client
+
+
+def _msgmap(max_client):
+    return getattr(max_client, "msgmap", None)
+
+
+def _max_reply_target(message, max_chat_id, max_client) -> str | None:
+    """Max message id the Telegram message replies to, if it is a bridged one.
+
+    In forum topics every message "replies" to the topic's root service
+    message; that one is never in the map, so it is ignored naturally.
+    """
+    mm = _msgmap(max_client)
+    replied = getattr(message, "reply_to_message", None)
+    replied_id = getattr(replied, "message_id", None)
+    if mm is None or not isinstance(replied_id, int):
+        return None
+    found = mm.max_for_tg(replied_id)
+    if found and str(found[0]) == str(max_chat_id):
+        return found[1]
+    return None
+
+
+def _remember_sent(message, max_chat_id, max_client, resp, text) -> None:
+    mm = _msgmap(max_client)
+    max_msg_id = MaxClient.sent_message_id(resp)
+    if mm is not None and max_msg_id:
+        mm.add(max_chat_id, max_msg_id, message.message_id, text)
+
+
+def _send_kwargs(reply_to) -> dict:
+    return {"reply_to": reply_to} if reply_to else {}
 
 
 async def _surface_send_result(message, resp) -> None:
@@ -160,15 +195,75 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     elements = _entities_to_max_elements(message.text, message.entities)
+    reply_to = _max_reply_target(message, max_chat_id, max_client)
     try:
         resp = await max_client.send_message(max_chat_id, message.text,
-                                              elements=elements)
+                                              elements=elements,
+                                              **_send_kwargs(reply_to))
     except Exception:
         log.exception("Failed to send reply to Max chat %s", max_chat_id)
         await message.reply_text("⚠️ Ошибка при отправке в Max.")
         return
 
+    _remember_sent(message, max_chat_id, max_client, resp, message.text)
     await _surface_send_result(message, resp)
+
+
+async def _on_topic_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mirror an edit of a bridged text message into Max (opcode 67)."""
+    edited = update.edited_message
+    if edited is None or not edited.text:
+        return
+    target = _resolve_topic_target(update, context, message=edited)
+    if not target:
+        return
+    message, max_chat_id, max_client = target
+    mm = _msgmap(max_client)
+    found = mm.max_for_tg(message.message_id) if mm is not None else None
+    if not max_client or not found or str(found[0]) != str(max_chat_id):
+        return
+    elements = _entities_to_max_elements(message.text, message.entities)
+    try:
+        resp = await max_client.edit_message(max_chat_id, found[1], message.text,
+                                             elements=elements)
+    except Exception:
+        log.exception("Failed to edit Max message %s", found[1])
+        resp = None
+    err = (resp or {}).get("_max_error")
+    if not resp or err:
+        desc = (err or {}).get("localizedMessage") or (err or {}).get("message") or "нет ответа"
+        await message.reply_text(f"⚠️ MAX не принял правку: {desc}")
+        return
+    mm.set_text(max_chat_id, found[1], message.text)
+
+
+async def _cmd_rm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete in Max the bridged message this command replies to.
+
+    Telegram does not tell bots about deletions, so removal has to be
+    explicit: reply to your message with /rm.
+    """
+    message = update.message
+    if message is None:
+        return
+    target = _resolve_topic_target(update, context)
+    if not target:
+        await message.reply_text("Команда работает только внутри топика, связанного с MAX-чатом.")
+        return
+    _, max_chat_id, max_client = target
+    reply_to = _max_reply_target(message, max_chat_id, max_client)
+    if not max_client or not reply_to:
+        await message.reply_text(
+            "Ответьте командой /rm на своё сообщение, отправленное в MAX через мост."
+        )
+        return
+    resp = await max_client.delete_messages(max_chat_id, [reply_to], for_me=False)
+    err = (resp or {}).get("_max_error")
+    if not resp or err:
+        desc = (err or {}).get("localizedMessage") or (err or {}).get("message") or "нет ответа"
+        await message.reply_text(f"⚠️ MAX не удалил сообщение: {desc}")
+        return
+    await message.reply_text("🗑 Удалено в MAX.")
 
 
 async def _download_tg_file(file_obj) -> bytes | None:
@@ -197,21 +292,59 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     caption = message.caption or ""
 
     # ── pick the right uploader for the attached media ────────────
+    async def fetch(file_obj, what: str) -> bytes | None:
+        size = getattr(file_obj, "file_size", None)
+        if isinstance(size, int) and size > TG_BOT_DOWNLOAD_LIMIT:
+            await message.reply_text(
+                f"⚠️ {what} больше 20 МБ — Bot API не даёт боту его скачать."
+            )
+            return None
+        data = await _download_tg_file(file_obj)
+        if data is None:
+            await message.reply_text(f"⚠️ Не удалось скачать {what.lower()} из Telegram.")
+        return data
+
+    async def video_or_file(data: bytes, filename: str, mimetype: str):
+        # Native MAX video first; fall back to a plain file attach.
+        attach = await max_client.upload_video(data, chat_id=max_chat_id,
+                                               filename=filename, mimetype=mimetype)
+        if attach is None:
+            log.info("Video upload failed, sending %s as a file", filename)
+            attach = await max_client.upload_file(data, chat_id=max_chat_id,
+                                                  filename=filename, mimetype=mimetype)
+        return attach
+
     attach = None
     if message.photo:
         # message.photo is a list of progressively larger PhotoSize objects;
         # the last one is the highest resolution.
-        photo = message.photo[-1]
-        data = await _download_tg_file(photo)
+        data = await fetch(message.photo[-1], "Фото")
         if data is None:
-            await message.reply_text("⚠️ Не удалось скачать фото из Telegram.")
             return
         attach = await max_client.upload_photo(data, chat_id=max_chat_id)
 
+    elif message.sticker:
+        st = message.sticker
+        if not st.is_animated and not st.is_video:
+            data = await fetch(st, "Стикер")
+            if data is None:
+                return
+            attach = await max_client.upload_photo(data, chat_id=max_chat_id,
+                                                   filename="sticker.webp",
+                                                   mimetype="image/webp")
+        elif st.thumbnail:
+            # Animated (.tgs) / video (.webm) stickers: send the static preview.
+            data = await fetch(st.thumbnail, "Стикер")
+            if data is None:
+                return
+            attach = await max_client.upload_photo(data, chat_id=max_chat_id)
+        else:
+            await message.reply_text("⚠️ Анимированный стикер без превью — MAX его не покажет.")
+            return
+
     elif message.voice:
-        data = await _download_tg_file(message.voice)
+        data = await fetch(message.voice, "Голосовое")
         if data is None:
-            await message.reply_text("⚠️ Не удалось скачать голосовое из Telegram.")
             return
         attach = await max_client.upload_audio(
             data, chat_id=max_chat_id,
@@ -220,9 +353,8 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
     elif message.audio:
-        data = await _download_tg_file(message.audio)
+        data = await fetch(message.audio, "Аудио")
         if data is None:
-            await message.reply_text("⚠️ Не удалось скачать аудио из Telegram.")
             return
         attach = await max_client.upload_file(
             data, chat_id=max_chat_id,
@@ -230,26 +362,39 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             mimetype=message.audio.mime_type or "audio/mpeg",
         )
 
-    elif message.document:
-        data = await _download_tg_file(message.document)
+    elif message.animation:
+        # Checked before .document: Telegram sets both for GIF/MP4 animations.
+        data = await fetch(message.animation, "Анимация")
         if data is None:
-            await message.reply_text("⚠️ Не удалось скачать файл из Telegram.")
+            return
+        attach = await video_or_file(
+            data, message.animation.file_name or "animation.mp4",
+            message.animation.mime_type or "video/mp4",
+        )
+
+    elif message.video_note:
+        data = await fetch(message.video_note, "Видеосообщение")
+        if data is None:
+            return
+        attach = await video_or_file(data, "video_note.mp4", "video/mp4")
+
+    elif message.video:
+        data = await fetch(message.video, "Видео")
+        if data is None:
+            return
+        attach = await video_or_file(
+            data, message.video.file_name or "video.mp4",
+            message.video.mime_type or "video/mp4",
+        )
+
+    elif message.document:
+        data = await fetch(message.document, "Файл")
+        if data is None:
             return
         attach = await max_client.upload_file(
             data, chat_id=max_chat_id,
             filename=message.document.file_name or "file",
             mimetype=message.document.mime_type or "application/octet-stream",
-        )
-
-    elif message.video:
-        data = await _download_tg_file(message.video)
-        if data is None:
-            await message.reply_text("⚠️ Не удалось скачать видео из Telegram.")
-            return
-        attach = await max_client.upload_file(
-            data, chat_id=max_chat_id,
-            filename=message.video.file_name or "video.mp4",
-            mimetype=message.video.mime_type or "video/mp4",
         )
 
     else:
@@ -260,16 +405,33 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     elements = _entities_to_max_elements(caption, message.caption_entities)
+    reply_to = _max_reply_target(message, max_chat_id, max_client)
     try:
         resp = await max_client.send_message(max_chat_id, text=caption,
                                               elements=elements,
-                                              attaches=[attach])
+                                              attaches=[attach],
+                                              **_send_kwargs(reply_to))
     except Exception:
         log.exception("Failed to send media reply to Max chat %s", max_chat_id)
         await message.reply_text("⚠️ Ошибка при отправке в Max.")
         return
 
+    _remember_sent(message, max_chat_id, max_client, resp, caption)
     await _surface_send_result(message, resp)
+
+
+async def _on_topic_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tell the user a message kind can't be bridged instead of dropping it."""
+    target = _resolve_topic_target(update, context)
+    if not target:
+        return
+    message = target[0]
+    if message.text or message.caption:
+        return
+    await message.reply_text(
+        "⚠️ Этот тип сообщения (опрос, геолокация, контакт, кубик…) в MAX "
+        "не передаётся. Отправьте текстом или файлом."
+    )
 
 
 async def post_topic_intro(bot, supergroup_id, max_client: MaxClient,
@@ -615,13 +777,15 @@ HELP_TEXT = (
     "из MAX (имя, id, аватар).\n"
     "• <code>/intro</code> — перепостить и закрепить карточку профиля "
     "в текущем топике (полезно после смены аватара).\n"
+    "• <code>/rm</code> — ответом на своё сообщение: удалить его в MAX.\n"
     "• <code>/del</code> — удалить текущий топик и связь с MAX-чатом "
     "(спросит подтверждение).\n"
     "• <code>/help</code> — эта справка.\n\n"
     "Просто пиши в любом привязанном топике — сообщение уйдёт в "
     "соответствующий чат MAX. Поддерживается жирный/курсив/зачёркнутый/"
     "подчёркнутый текст, моноширинный код и ссылки (цитаты уходят обычным текстом). Фото, "
-    "документы и видео тоже передаются. Голосовые приходят как .ogg "
+    "документы, видео, GIF, кружки и стикеры тоже передаются; ответы (reply) и "
+    "правки текста уходят в MAX. Голосовые приходят как .ogg "
     "файл (пока MAX не вернул нам опкод нативной загрузки).\n\n"
     "Если кто-то новый пишет тебе в MAX — топик создастся автоматически "
     "и в нём сразу появится карточка собеседника."
@@ -898,16 +1062,31 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("intro", _cmd_intro, filters=chat_filter))
     app.add_handler(CommandHandler("del", _cmd_del, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
+    app.add_handler(CommandHandler("rm", _cmd_rm, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(_on_del_callback, pattern=r"^del:"))
+    # Edits first: otherwise the text handler below would swallow them.
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, _on_topic_message)
+        MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.TEXT & chat_filter,
+                       _on_topic_edit)
+    )
+    new_msg = filters.UpdateType.MESSAGE & chat_filter
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & new_msg, _on_topic_message)
     )
     media_filter = (
         filters.PHOTO | filters.VOICE | filters.AUDIO
-        | filters.Document.ALL | filters.VIDEO
+        | filters.Document.ALL | filters.VIDEO | filters.ANIMATION
+        | filters.VIDEO_NOTE | filters.Sticker.ALL
     )
     app.add_handler(
-        MessageHandler(media_filter & chat_filter, _on_topic_media)
+        MessageHandler(media_filter & new_msg, _on_topic_media)
+    )
+    app.add_handler(
+        MessageHandler(
+            (filters.POLL | filters.LOCATION | filters.CONTACT | filters.Dice.ALL
+             | filters.VENUE) & new_msg,
+            _on_topic_unsupported,
+        )
     )
 
     return app
