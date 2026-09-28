@@ -56,18 +56,24 @@ class _Rpc:
             {"ver": 11, "cmd": 0, "seq": seq, "opcode": opcode, "payload": payload},
             ensure_ascii=False,
         ))
-        async with asyncio.timeout(timeout):
-            while True:
-                msg = await self._ws.receive()
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    raise LoginError(f"соединение с MAX закрыто ({msg.type.name})")
-                data = json.loads(msg.data)
-                if data.get("seq") != seq or data.get("cmd") not in (1, 3):
-                    continue  # server events, pings, ...
-                payload = data.get("payload") or {}
-                if data["cmd"] == 3 or "error" in payload:
-                    raise LoginError(_describe(payload))
-                return payload
+        try:
+            # wait_for, not asyncio.timeout: keeps Python 3.10 (Ubuntu 22.04) working.
+            return await asyncio.wait_for(self._reply(seq), timeout)
+        except asyncio.TimeoutError:
+            raise LoginError(f"MAX не ответил за {timeout:.0f} с (op {opcode})") from None
+
+    async def _reply(self, seq: int) -> dict:
+        while True:
+            msg = await self._ws.receive()
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                raise LoginError(f"соединение с MAX закрыто ({msg.type.name})")
+            data = json.loads(msg.data)
+            if data.get("seq") != seq or data.get("cmd") not in (1, 3):
+                continue  # server events, pings, ...
+            payload = data.get("payload") or {}
+            if data["cmd"] == 3 or "error" in payload:
+                raise LoginError(_describe(payload))
+            return payload
 
 
 def _describe(err: dict) -> str:
