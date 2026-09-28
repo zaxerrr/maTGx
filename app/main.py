@@ -84,6 +84,11 @@ async def main():
     )
 
     tg_app = None
+    if settings.reply_enabled and settings.tg_allowed_user_id is None:
+        log.warning(
+            "TG_ALLOWED_USER_ID is not set: ANY member of the supergroup can "
+            "send messages to MAX on your behalf. Set it in .env."
+        )
     if settings.reply_enabled:
         tg_app = build_tg_app(settings.tg_bot_token, client, settings.tg_chat_id,
                               topic_store, allowed_user_id=settings.tg_allowed_user_id,

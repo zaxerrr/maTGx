@@ -182,3 +182,30 @@ class TestReconnectNotification:
         await client._on_ready_cb(snapshot)
         sender.send.assert_called_once()
         assert "восстановлено" in sender.send.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# on_auth_failed alert
+# ---------------------------------------------------------------------------
+
+class TestAuthFailedAlert:
+    async def test_alert_sent_once_per_failure_streak(self):
+        client, sender = _make_client()
+        await client._on_auth_failed_cb("сервер отклонил токен")
+        await client._on_auth_failed_cb("сервер отклонил токен")
+        sender.send.assert_called_once()
+        assert "MAX_TOKEN" in sender.send.call_args.args[0]
+
+    async def test_alert_rearmed_after_successful_auth(self):
+        client, sender = _make_client()
+        await client._on_auth_failed_cb("x")
+        await client._on_ready_cb({"profile": {"id": 1}, "chats": []})
+        sender.send.reset_mock()
+        await client._on_auth_failed_cb("x")
+        sender.send.assert_called_once()
+
+    async def test_reason_is_html_escaped(self):
+        client, sender = _make_client()
+        await client._on_auth_failed_cb("<bad> & reason")
+        text = sender.send.call_args.args[0]
+        assert "&lt;bad&gt; &amp; reason" in text

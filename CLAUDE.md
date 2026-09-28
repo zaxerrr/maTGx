@@ -20,7 +20,7 @@ app/
   tg_sender.py     # TelegramSender + ensure_topic (create/rename)
   tg_handler.py    # TG → MAX handler + команды /bind, /add, /profile, /intro, /del, /help
   topics.py        # TopicStore: JSON-карта max_chat_id ↔ thread_id
-tests/             # 191 pytest, asyncio_mode=auto
+tests/             # 219 pytest, asyncio_mode=auto
 docs/cover.jpg     # обложка README
 state/             # runtime (топик-карта), gitignored
 logs/              # логи, gitignored
@@ -66,8 +66,8 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 | STRIKETHROUGH | `STRIKETHROUGH` |
 | UNDERLINE | `UNDERLINE` |
 | CODE | `MONOSPACED` |
-| PRE | `BLOCKQUOTE` (MAX не имеет boxed code-block; квоту юзер сам выбрал) |
-| BLOCKQUOTE / EXPANDABLE_BLOCKQUOTE | `BLOCKQUOTE` |
+| PRE | `MONOSPACED` (MAX WS не имеет code-block) |
+| BLOCKQUOTE / EXPANDABLE_BLOCKQUOTE | — (WS отвергает `BLOCKQUOTE`, уходит обычным текстом) |
 | TEXT_LINK | `LINK` с `attributes.url` |
 
 `CODE_BLOCK` отвергается валидацией (`No enum constant`). Имена `EMPHASIS`, `EM`, `ITALIC` тоже отвергались — пришли к `EMPHASIZED` (как в `max-botapi-python.enums.text_style`).
@@ -79,7 +79,9 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 ### Особенности WS
 
 - `proto.payload` ошибки **закрывают WS** для некоторых опкодов (мост авто-реконнектится через 5 сек). Это мешает массовому пробингу: после первой неудачи остальные опкоды успевают только таймаут схватить.
-- Токен MAX молча ротируется при логине в web.max.ru с другого устройства: handshake проходит, AUTH_SNAPSHOT не приходит → бот висит. Решение — освежить `MAX_TOKEN`.
+- Токен MAX молча ротируется при логине в web.max.ru с другого устройства: handshake проходит, AUTH_SNAPSHOT не приходит (или приходит `cmd=3`). Watchdog в `_heartbeat_loop` ловит оба случая (таймаут `AUTH_TIMEOUT_SEC`), шлёт алерт через `on_auth_failed` и переподключается с backoff до `MAX_RECONNECT_SEC`. Решение — освежить `MAX_TOKEN`.
+- Пинг (op=1) ждёт ответа `PING_TIMEOUT_SEC`; нет ответа → WS закрывается и переоткрывается (half-open TCP).
+- `on_ready` запускается задачей, а не await'ом в цикле чтения: внутри него идут RPC, ответы на которые читает тот же цикл.
 
 ## Telegram-side нюансы
 
@@ -105,7 +107,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Тесты
 
-`pytest -q` → 191 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды.
+`pytest -q` → 219 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды + авторизация/watchdog/backoff, tg_sender split_html.
 
 ## Деплой
 
@@ -130,7 +132,7 @@ pytest -q
 ssh max2tg "cd /opt/max2tg && docker compose ps && docker compose logs --tail=50 max2tg"
 
 # Структура развёртывания
-# - Контейнер max2tg-max2tg-1, образ собран из ./Dockerfile (python:3.12-slim → alpine; работает несмотря на glibc→musl, потому что слои совместимы).
+# - Контейнер max2tg-max2tg-1, образ собран из ./Dockerfile (один этап на python:3.12-slim; раньше копировали glibc-колёса в alpine — C-расширения aiohttp там не грузились).
 ```
 
 ## Ссылки

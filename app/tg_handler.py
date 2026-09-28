@@ -291,7 +291,7 @@ async def post_topic_intro(bot, supergroup_id, max_client: MaxClient,
         contact = resolver.contacts_raw.get(peer_id)
         if contact is None:
             try:
-                await max_client.fetch_contacts([peer_id])
+                await resolver.refresh_contacts([peer_id])
             except Exception:
                 log.exception("post_topic_intro: fetch_contacts failed")
             contact = resolver.contacts_raw.get(peer_id)
@@ -573,7 +573,7 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if peer_id is not None:
                 # Best-effort fetch contact name now.
                 try:
-                    await max_client.fetch_contacts([peer_id])
+                    await resolver.refresh_contacts([peer_id])
                 except Exception:
                     pass
                 title = resolver.user_name(peer_id)
@@ -620,7 +620,7 @@ HELP_TEXT = (
     "• <code>/help</code> — эта справка.\n\n"
     "Просто пиши в любом привязанном топике — сообщение уйдёт в "
     "соответствующий чат MAX. Поддерживается жирный/курсив/зачёркнутый/"
-    "подчёркнутый текст, моноширинный код, цитаты и ссылки. Фото, "
+    "подчёркнутый текст, моноширинный код и ссылки (цитаты уходят обычным текстом). Фото, "
     "документы и видео тоже передаются. Голосовые приходят как .ogg "
     "файл (пока MAX не вернул нам опкод нативной загрузки).\n\n"
     "Если кто-то новый пишет тебе в MAX — топик создастся автоматически "
@@ -802,30 +802,12 @@ async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     contact = resolver.contacts_raw.get(peer_id)
     if contact is None:
-        # Probe several payload shapes / opcodes so we can see in the log
-        # what MAX is willing to return for a peer that's not in contacts.
-        probes = [
-            (32, {"contactIds": [peer_id]}),
-            (32, {"contactIds": [str(peer_id)]}),
-            (32, {"userIds": [peer_id]}),
-            (32, {"userId": peer_id}),
-            (35, {"contactIds": [peer_id]}),   # CONTACT_PRESENCE
-            (33, {"contactIds": [peer_id]}),
-            (36, {"contactIds": [peer_id]}),
-        ]
-        for op, payload in probes:
-            try:
-                resp = await max_client.cmd(op, payload)
-            except Exception:
-                log.exception("/profile probe op=%d failed", op)
-                continue
-            log.info("/profile probe op=%d payload=%s → %s",
-                     op, payload, str(resp)[:600])
-            if resp and "_max_error" not in resp:
-                # Let the resolver opportunistically pick up new fields.
-                resolver._parse_contacts_response(resp)
-                if peer_id in resolver.contacts_raw:
-                    break
+        # Only CONTACT_GET (op 32) with the known payload shape: a malformed
+        # payload on other opcodes makes MAX drop the whole WebSocket.
+        try:
+            await resolver.refresh_contacts([peer_id])
+        except Exception:
+            log.exception("/profile: fetch_contacts failed")
         contact = resolver.contacts_raw.get(peer_id)
 
     if contact is None:

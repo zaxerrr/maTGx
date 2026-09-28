@@ -54,6 +54,12 @@ class ContactResolver:
         if unknown:
             await self._ws_fetch_contacts(unknown)
 
+    async def refresh_contacts(self, user_ids: list) -> None:
+        """Fetch contacts from MAX even if already cached, updating
+        ``users`` / ``contacts_raw`` with whatever the server returns."""
+        if user_ids:
+            await self._ws_fetch_contacts(user_ids)
+
     # ── populate from AUTH_SNAPSHOT ────────────────────────────────
 
     def load_snapshot(self, snapshot: dict) -> list:

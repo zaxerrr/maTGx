@@ -91,16 +91,30 @@ class MaxMessage:
     raw: dict = field(default_factory=dict)
 
 
+def _mask_token(obj):
+    """Return a copy of a packet/payload with any ``token`` values masked,
+    so auth credentials never end up in logs or debug dumps."""
+    if isinstance(obj, dict):
+        return {k: ("***" if k == "token" and isinstance(v, str) else _mask_token(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_mask_token(v) for v in obj]
+    return obj
+
+
 class MaxClient:
     WS_URL = "wss://ws-api.oneme.ru/websocket"
     HEARTBEAT_SEC = 30
+    PING_TIMEOUT_SEC = 15      # no reply to a heartbeat ping → connection is dead
+    AUTH_TIMEOUT_SEC = 30      # no AUTH_SNAPSHOT after connect → token is likely stale
     RECONNECT_SEC = 5
-    chat_ids = []
+    MAX_RECONNECT_SEC = 300    # backoff cap while the connection keeps failing
 
     def __init__(self, token: str, device_id: str, chat_ids: str | None = None, debug: bool = False):
         self.token = token
         self.device_id = device_id
         self.debug = debug
+        self.chat_ids: list[int] = []
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._seq = 0
         self._my_id = None
@@ -112,6 +126,9 @@ class MaxClient:
         self._pending: dict[int, asyncio.Future] = {}
         self._file_pending: dict[int, asyncio.Future] = {}
         self._on_disconnect_cb = None
+        self._on_auth_failed_cb = None
+        self._authorized = False
+        self._reconnect_delay = self.RECONNECT_SEC
         if chat_ids:
             self.chat_ids += map(int, map(str.strip, chat_ids.split(',')))
 
@@ -129,6 +146,12 @@ class MaxClient:
         self._on_disconnect_cb = func
         return func
 
+    def on_auth_failed(self, func):
+        """Called with a human-readable reason when MAX rejects the token or
+        never completes authorization."""
+        self._on_auth_failed_cb = func
+        return func
+
     # ── transport ──────────────────────────────────────────────────
 
     async def _send(self, opcode: int, payload: dict) -> int:
@@ -144,35 +167,87 @@ class MaxClient:
         }
         self._seq += 1
         raw = json.dumps(pkt, ensure_ascii=False)
-        log.debug(">>> SEND op=%d seq=%d | %s", opcode, seq, raw[:800])
+        if log.isEnabledFor(logging.DEBUG):
+            masked = json.dumps(_mask_token(pkt), ensure_ascii=False)
+            log.debug(">>> SEND op=%d seq=%d | %s", opcode, seq, masked[:800])
         await self._ws.send_str(raw)
         return seq
 
-    async def cmd(self, opcode: int, payload: dict, timeout: float = 10) -> dict:
-        """Send a request and wait for the response (cmd=1 with same seq)."""
+    async def _request(self, opcode: int, payload: dict, timeout: float) -> dict:
+        """Send a request and wait for its response (same seq).
+
+        Raises ``asyncio.TimeoutError`` if no response arrives in time and
+        ``ConnectionError`` if the socket is not open.
+        """
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict] = loop.create_future()
         seq = await self._send(opcode, payload)
+        if seq < 0:
+            raise ConnectionError("MAX WebSocket is not connected")
         self._pending[seq] = fut
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            log.warning("cmd timeout: op=%d seq=%d", opcode, seq)
-            return {}
         finally:
             self._pending.pop(seq, None)
 
-    async def _heartbeat_loop(self):
-        while True:
-            await asyncio.sleep(self.HEARTBEAT_SEC)
-            try:
-                if self._ws and not self._ws.closed:
-                    await self._send(OpCode.HEARTBEAT_PING, {"interactive": False})
-                else:
+    async def cmd(self, opcode: int, payload: dict, timeout: float = 10) -> dict:
+        """Send a request and wait for the response (cmd=1 with same seq).
+
+        Returns ``{}`` on timeout or when not connected.
+        """
+        try:
+            return await self._request(opcode, payload, timeout)
+        except asyncio.TimeoutError:
+            log.warning("cmd timeout: op=%d", opcode)
+            return {}
+        except ConnectionError:
+            log.warning("cmd op=%d skipped: MAX is not connected", opcode)
+            return {}
+
+    async def _heartbeat_loop(self, ws, connected_at: float):
+        """Keep the connection alive and tear it down when it is stuck.
+
+        - AUTH_SNAPSHOT never arrived → the token was most likely rotated
+          (the server accepts the handshake but stays silent).
+        - A heartbeat ping got no reply → the TCP connection is half-open.
+
+        Closing ``ws`` ends the read loop in ``run()``, which reconnects.
+        """
+        loop = asyncio.get_running_loop()
+        while not ws.closed:
+            if not self._authorized:
+                remaining = connected_at + self.AUTH_TIMEOUT_SEC - loop.time()
+                if remaining <= 0:
+                    await self._auth_failed(
+                        f"сервер не прислал AUTH_SNAPSHOT за {self.AUTH_TIMEOUT_SEC} с"
+                    )
                     break
-            except Exception:
-                log.exception("Heartbeat error, stopping heartbeat loop")
+                await asyncio.sleep(min(remaining, self.HEARTBEAT_SEC))
+                continue
+            await asyncio.sleep(self.HEARTBEAT_SEC)
+            if ws.closed:
                 break
+            try:
+                await self._request(OpCode.HEARTBEAT_PING, {"interactive": False},
+                                    timeout=self.PING_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                log.warning("Heartbeat ping got no reply in %ds — reconnecting",
+                            self.PING_TIMEOUT_SEC)
+                await ws.close()
+                break
+            except Exception:
+                log.exception("Heartbeat error — reconnecting")
+                await ws.close()
+                break
+
+    async def _auth_failed(self, reason: str) -> None:
+        log.error("MAX authorization failed: %s. Refresh MAX_TOKEN in .env "
+                  "(web.max.ru → Local Storage → __oneme_auth).", reason)
+        if self._on_auth_failed_cb:
+            task = asyncio.create_task(self._on_auth_failed_cb(reason))
+            task.add_done_callback(_log_task_exception)
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
 
     # ── main loop ──────────────────────────────────────────────────
 
@@ -191,6 +266,7 @@ class MaxClient:
                         self._ws = ws
                         self._seq = 0
                         self._pending.clear()
+                        self._authorized = False
 
                         log.info("Connected. Sending handshake...")
                         await self._send(
@@ -206,7 +282,7 @@ class MaxClient:
                         )
 
                         self._heartbeat_task = asyncio.create_task(
-                            self._heartbeat_loop()
+                            self._heartbeat_loop(ws, asyncio.get_running_loop().time())
                         )
 
                         async for msg in ws:
@@ -236,8 +312,21 @@ class MaxClient:
                     except Exception:
                         log.exception("on_disconnect callback error")
 
-                log.info("Reconnecting in %ds...", self.RECONNECT_SEC)
-                await asyncio.sleep(self.RECONNECT_SEC)
+                # Successful auth resets the delay; repeated failures (bad
+                # token, network down) back off so we don't hammer MAX.
+                delay = self._next_reconnect_delay()
+                log.info("Reconnecting in %ds...", delay)
+                await asyncio.sleep(delay)
+
+    def _next_reconnect_delay(self) -> int:
+        if self._authorized:
+            self._reconnect_delay = self.RECONNECT_SEC
+        # Consumed: failed connects after this (e.g. network down) must keep
+        # backing off instead of resetting on a stale flag.
+        self._authorized = False
+        delay = self._reconnect_delay
+        self._reconnect_delay = min(self._reconnect_delay * 2, self.MAX_RECONNECT_SEC)
+        return delay
 
     # ── event dispatcher ───────────────────────────────────────────
 
@@ -279,14 +368,25 @@ class MaxClient:
                     },
                 )
 
+            elif op in (OpCode.HANDSHAKE, OpCode.AUTH_SNAPSHOT) and cmd == 3:
+                await self._auth_failed(
+                    f"сервер отклонил {'handshake' if op == OpCode.HANDSHAKE else 'токен'}: "
+                    f"{payload_preview[:300]}"
+                )
+
             elif op == OpCode.AUTH_SNAPSHOT and cmd == 1:
+                self._authorized = True
                 self._my_id = payload.get("profile", {}).get("id")
                 log.info("Authorized! my_id=%s", self._my_id)
                 if self.debug:
                     self._dump_json("snapshot.json", payload)
 
                 if self._on_ready_cb:
-                    await self._on_ready_cb(payload)
+                    # Run as a task: the callback issues RPCs (contact lookup)
+                    # whose replies are read by this very loop — awaiting it
+                    # here would block until every such request timed out.
+                    task = asyncio.create_task(self._on_ready_cb(payload))
+                    task.add_done_callback(_log_task_exception)
 
             elif op == OpCode.DISPATCH:
                 self._dispatch_counter += 1
@@ -655,7 +755,7 @@ class MaxClient:
         path = os.path.join(DEBUG_DIR, filename)
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                json.dump(_mask_token(data), f, ensure_ascii=False, indent=2)
             log.info("Dumped %s (%d bytes)", path, os.path.getsize(path))
         except Exception:
             log.exception("Failed to dump %s", path)

@@ -45,7 +45,7 @@
 - Уведомления о статусе подключения к MAX в General-топик (с троттлингом)
 
 ### Telegram → MAX
-- Текст с форматированием (`STRONG`, `EMPHASIZED`, `STRIKETHROUGH`, `UNDERLINE`, `MONOSPACED`, `BLOCKQUOTE`, `LINK`)
+- Текст с форматированием (`STRONG`, `EMPHASIZED`, `STRIKETHROUGH`, `UNDERLINE`, `MONOSPACED`, `LINK`; цитаты уходят обычным текстом)
 - Фото (через нативный photo-upload MAX, опкод 80)
 - Документы, видео, аудио (через file-upload MAX, опкод 87)
 - Голосовые приходят в MAX как файл `.ogg` (опкод нативной voice-загрузки пока не реверсен)
@@ -121,7 +121,7 @@
 ### 3. Деплой (Docker, рекомендованный)
 
 ```bash
-git clone https://github.com/ircitdev/MAX2TG-Bridge.git max2tg
+git clone https://github.com/zaxerrr/maTGx.git max2tg
 cd max2tg
 cp .env.example .env
 # отредактируйте .env
@@ -211,7 +211,7 @@ sudo journalctl -u max2tg -f
 4. **Лимит Telegram Bot API** — 20 МБ на загрузку файла ботом. Большие файлы из топика не дойдут до MAX.
 5. **Кастомные эмодзи как реакции** — Telegram запрещает ботам ставить custom-emoji реакции, поэтому используется обычная `👀`.
 6. **Phone / about** в `/profile` отсутствуют — опкод `CONTACT_GET` (32) возвращает только имя и аватар.
-7. **Ротация MAX-токена** — если ты залогинишься в web.max.ru с другого устройства, токен моста может стать невалидным (handshake висит без `Authorized!`). Решение: обновить `MAX_TOKEN` в `.env`.
+7. **Ротация MAX-токена** — если ты залогинишься в web.max.ru с другого устройства, токен моста может стать невалидным. Мост это замечает (ошибка авторизации или нет `AUTH_SNAPSHOT` за 30 с), присылает в General-топик «❌ Max: авторизация не прошла» и переподключается с нарастающей паузой (до 5 мин). Решение: обновить `MAX_TOKEN` в `.env` и перезапустить.
 
 ---
 
@@ -224,7 +224,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды). 191 тест.
+Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды, авторизация, watchdog, backoff), `app/tg_sender.py` (HTML-безопасная разбивка длинных сообщений). 219 тестов.
 
 ### Структура проекта
 
@@ -239,7 +239,7 @@ max2tg/
 │   ├── tg_sender.py        # TG отправка + ensure_topic
 │   ├── tg_handler.py       # TG → MAX роутинг и команды
 │   └── topics.py           # TopicStore (JSON-карта)
-├── tests/                  # 191 pytest
+├── tests/                  # 219 pytest
 ├── docs/cover.jpg          # обложка README
 ├── state/                  # рантайм-данные (gitignored)
 ├── logs/                   # логи (gitignored)

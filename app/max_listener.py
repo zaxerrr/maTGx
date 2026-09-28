@@ -257,6 +257,7 @@ def create_max_client(
     _first_connect = True
     _notif_count = 0
     _last_notif_time: datetime | None = None
+    _auth_alert_sent = False
 
     def _can_notify() -> bool:
         if _last_notif_time is None:
@@ -270,16 +271,17 @@ def create_max_client(
 
     @client.on_ready
     async def handle_ready(snapshot: dict):
-        nonlocal _first_connect
+        nonlocal _first_connect, _auth_alert_sent
+        _auth_alert_sent = False
         participant_ids = resolver.load_snapshot(snapshot)
 
         if participant_ids:
             log.info("Batch-resolving %d participants...", len(participant_ids))
             await resolver.resolve_users_batch(participant_ids)
-            log.info("Resolved users: %s", resolver.users)
-
-            log.info("Known chats: %s", resolver.chats)
-            log.info("Known users: %s", resolver.users)
+            log.info("Resolved %d users, %d chats known",
+                     len(resolver.users), len(resolver.chats))
+            log.debug("Known chats: %s", resolver.chats)
+            log.debug("Known users: %s", resolver.users)
 
         if not _first_connect:
             await sender.send("✅ <b>Max:</b> соединение восстановлено")
@@ -287,6 +289,21 @@ def create_max_client(
             chat_count = len(resolver.chats)
             await sender.send(f"✅ <b>Max:</b> подключён | чатов: {chat_count}")
         _first_connect = False
+
+    @client.on_auth_failed
+    async def handle_auth_failed(reason: str):
+        # One alert per failure streak — reconnect attempts keep failing the
+        # same way until the token is replaced, no point repeating it.
+        nonlocal _auth_alert_sent
+        if _auth_alert_sent:
+            return
+        _auth_alert_sent = True
+        await sender.send(
+            "❌ <b>Max:</b> авторизация не прошла — "
+            f"{escape(reason)}.\n"
+            "Скорее всего, токен устарел (вход в web.max.ru с другого устройства). "
+            "Обновите <code>MAX_TOKEN</code> в <code>.env</code> и перезапустите мост."
+        )
 
     @client.on_disconnect
     async def handle_disconnect():
@@ -301,11 +318,11 @@ def create_max_client(
     @client.on_message
     async def handle_message(msg: MaxMessage):
         log.info(
-            "New message: chat=%s sender=%s is_self=%s text=%r attaches=%d",
+            "New message: chat=%s sender=%s is_self=%s text_len=%d attaches=%d",
             msg.chat_id,
             msg.sender_id,
             msg.is_self,
-            (msg.text[:80] + "…") if len(msg.text) > 80 else msg.text,
+            len(msg.text),
             len(msg.attaches),
         )
 
