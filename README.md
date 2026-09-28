@@ -124,6 +124,15 @@
    - `__oneme_auth` → **`MAX_TOKEN`**
    - `__oneme_device_id` → **`MAX_DEVICE_ID`**
 
+**Без браузера — входом по номеру и коду:**
+
+```bash
+python -m app.login --write-env .env                    # локально / systemd
+docker compose run --rm max2tg python -m app.login      # на сервере с Docker: значения печатаются, вставьте их в .env
+```
+
+Скрипт спросит номер, MAX пришлёт код (SMS или в приложение MAX), скрипт проверит полученный токен настоящим входом и выдаст `MAX_TOKEN` + `MAX_DEVICE_ID` (их нужно использовать вместе). Аккаунты с облачным паролем (2FA) пока не поддерживаются — скрипт об этом скажет. Если MAX ограничивает IP сервера, задайте `MAX_PROXY` или `--proxy`.
+
 > Этими значениями можно полностью завладеть аккаунтом MAX — не показывай никому.
 > При логине в web.max.ru с другого устройства токен может ротироваться — тогда повторите шаги выше и обновите `.env`.
 
@@ -238,7 +247,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды, авторизация, watchdog, backoff), `app/tg_sender.py` (HTML-безопасная разбивка, пересоздание топика, ответы, правки), `app/msgmap.py`, сквозной поток MAX → TG (порядок, дубли, правки, лимиты) и TG → MAX (ответы, правки, `/rm`, медиа). 279 тестов.
+Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды, авторизация, watchdog, backoff), `app/tg_sender.py` (HTML-безопасная разбивка, пересоздание топика, ответы, правки), `app/msgmap.py`, сквозной поток MAX → TG (порядок, дубли, правки, лимиты) и TG → MAX (ответы, правки, `/rm`, медиа). 292 тестов.
 
 ### Структура проекта
 
@@ -253,8 +262,9 @@ max2tg/
 │   ├── tg_sender.py        # TG отправка + ensure_topic
 │   ├── tg_handler.py       # TG → MAX роутинг и команды
 │   ├── msgmap.py           # SQLite-карта сообщений TG ↔ MAX (ответы, правки, /rm)
+│   ├── login.py            # python -m app.login — вход по номеру+коду, выдаёт MAX_TOKEN
 │   └── topics.py           # TopicStore (JSON-карта)
-├── tests/                  # 279 pytest
+├── tests/                  # 292 pytest
 ├── docs/cover.jpg          # обложка README
 ├── state/                  # рантайм-данные (gitignored)
 ├── logs/                   # логи (gitignored)

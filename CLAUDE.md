@@ -21,7 +21,8 @@ app/
   tg_handler.py    # TG → MAX handler + команды /bind, /add, /profile, /intro, /del, /help
   topics.py        # TopicStore: JSON-карта max_chat_id ↔ thread_id
   msgmap.py        # MessageMap: SQLite tg_msg_id ↔ (max_chat_id, max_msg_id) + последний текст
-tests/             # 279 pytest, asyncio_mode=auto
+  login.py         # `python -m app.login`: вход по телефону+коду (op 17/18) → MAX_TOKEN + MAX_DEVICE_ID
+tests/             # 292 pytest, asyncio_mode=auto
 docs/cover.jpg     # обложка README
 state/             # runtime (топик-карта), gitignored
 logs/              # логи, gitignored
@@ -37,7 +38,9 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 |---|---|
 | 1 | HEARTBEAT_PING (раз в 30 сек) |
 | 6 | HANDSHAKE |
-| 19 | AUTH_SNAPSHOT (логин + первый snapshot чатов) |
+| 17 | START_AUTH `{phone, type:"START_AUTH", language}` → `{token}` (код уходит в SMS/приложение). На несуществующий номер: cmd=3 «Проверка не пройдена» |
+| 18 | CHECK_CODE `{token, verifyCode, authTokenType:"CHECK_CODE"}` → `tokenAttrs.LOGIN.token` = MAX_TOKEN (deviceId из handshake = MAX_DEVICE_ID) |
+| 19 | AUTH_SNAPSHOT (логин + первый snapshot чатов). Невалидный токен → cmd=3 `error: login.token` (проверено вживую) |
 | 32 | CONTACT_GET — возвращает `{names, baseUrl, photoId}`, **НЕ возвращает phone/about** |
 | 35 | CONTACT_PRESENCE |
 | 48 | CHAT_GET |
@@ -119,7 +122,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Тесты
 
-`pytest -q` → 279 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды + авторизация/watchdog/backoff + edit/delete/video/file RPC, tg_sender (split_html, пересоздание топика, reply, edit), msgmap, сквозные потоки listener/handler.
+`pytest -q` → 292 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды + авторизация/watchdog/backoff + edit/delete/video/file RPC, tg_sender (split_html, пересоздание топика, reply, edit), msgmap, сквозные потоки listener/handler.
 
 ## Деплой
 
