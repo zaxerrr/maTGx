@@ -329,3 +329,101 @@ class TestNoNeedlessRestarts:
                                             can_manage_topics=True))
         await sb._on_my_chat_member(u, _ctx(br))
         br.start_account.assert_not_awaited()
+
+
+class TestLoginCommand:
+    def _fake_login(self):
+        fake = MagicMock()
+        fake.start = AsyncMock(return_value="+79991234567")
+        fake.close = AsyncMock()
+        return fake
+
+    async def test_login_with_phone_requests_code_immediately(self, tmp_path):
+        br = _bridge(tmp_path, owner=1)
+        ctx = _ctx(br)
+        ctx.args = ["+7", "999", "123-45-67"]
+        u = _update(text="/login +7 999 123-45-67")
+        fake = self._fake_login()
+        with patch.object(sb, "PhoneLogin", return_value=fake):
+            await sb._cmd_login(u, ctx)
+        fake.start.assert_awaited_once_with("+7 999 123-45-67")
+        assert br.dialogs[1]["step"] == "code" and br.dialogs[1]["acc_id"] == "a1"
+        assert "Код отправлен" in _last_text(u)
+
+    async def test_login_without_phone_asks_for_it(self, tmp_path):
+        br = _bridge(tmp_path, owner=1)
+        ctx = _ctx(br)
+        ctx.args = []
+        u = _update(text="/login")
+        await sb._cmd_login(u, ctx)
+        assert br.dialogs[1]["step"] == "phone"
+        assert "номер" in _last_text(u)
+
+    async def test_single_account_is_relogged(self, tmp_path):
+        br = _bridge(tmp_path, owner=1)
+        br.store.put(Account(id="main", name="Ann", token="old", device_id="d", group_id=-1))
+        ctx = _ctx(br)
+        ctx.args = []
+        await sb._cmd_login(_update(text="/login"), ctx)
+        assert br.dialogs[1]["acc_id"] == "main"
+
+    async def test_several_accounts_ask_which(self, tmp_path):
+        br = _bridge(tmp_path, owner=1)
+        br.store.put(Account(id="a1", name="Work"))
+        br.store.put(Account(id="a2", name="Home"))
+        ctx = _ctx(br)
+        ctx.args = ["+79991234567"]
+        u = _update(text="/login")
+        await sb._cmd_login(u, ctx)
+        kb = u.effective_message.reply_text.await_args.kwargs["reply_markup"]
+        datas = [b.callback_data for r in kb.inline_keyboard for b in r]
+        assert datas == ["acc:phone:a1", "acc:phone:a2", "acc:phone:a3"]
+        assert 1 not in br.dialogs
+
+    async def test_first_login_claims_owner(self, tmp_path):
+        br = _bridge(tmp_path)
+        ctx = _ctx(br)
+        ctx.args = []
+        await sb._cmd_login(_update(user_id=9, text="/login"), ctx)
+        assert br.owner_id == 9
+
+    async def test_stranger_cannot_login(self, tmp_path):
+        br = _bridge(tmp_path, owner=1)
+        ctx = _ctx(br)
+        ctx.args = ["+79991234567"]
+        with patch.object(sb, "PhoneLogin") as pl:
+            await sb._cmd_login(_update(user_id=2), ctx)
+        pl.assert_not_called()
+
+    async def test_deep_link_from_group_starts_login(self, tmp_path):
+        br = _bridge(tmp_path, owner=1)
+        ctx = _ctx(br)
+        ctx.args = ["login"]
+        u = _update(text="/start login")
+        await sb._cmd_start(u, ctx)
+        assert br.dialogs[1]["step"] == "phone"
+
+    async def test_login_in_group_points_to_private_chat(self, tmp_path):
+        br = _bridge(tmp_path, owner=1)
+        ctx = _ctx(br)
+        ctx.bot.username = "bridge_bot"
+        ctx.bot.send_message = AsyncMock()
+        u = _update(text="/login +79991234567")
+        u.effective_message.chat_id = -100
+        u.effective_message.is_topic_message = False
+        await sb._cmd_login_in_group(u, ctx)
+        u.effective_message.delete.assert_awaited()           # number wiped
+        kw = ctx.bot.send_message.await_args.kwargs
+        url = kw["reply_markup"].inline_keyboard[0][0].url
+        assert url == "https://t.me/bridge_bot?start=login"
+        assert 1 not in br.dialogs                             # nothing sent to MAX
+
+
+async def test_publish_commands_sets_private_and_group_menus():
+    bot = MagicMock()
+    bot.set_my_commands = AsyncMock()
+    await sb.publish_commands(bot)
+    scopes = [type(c.kwargs["scope"]).__name__ for c in bot.set_my_commands.await_args_list]
+    assert scopes == ["BotCommandScopeAllPrivateChats", "BotCommandScopeAllGroupChats"]
+    private = [c.command for c in bot.set_my_commands.await_args_list[0].args[0]]
+    assert "login" in private

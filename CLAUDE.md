@@ -27,7 +27,7 @@ app/
   accounts.py      # AccountStore: state/accounts.json (0600) — owner_id, аккаунты MAX, известные группы
   bridge.py        # Bridge: по MaxClient+TelegramSender+TopicStore+MessageMap на аккаунт; resolve_topic(group, thread)
   setup_bot.py     # диалог в личке (/start, кнопки acc:/grp:), обнаружение групп (my_chat_member, миграция)
-tests/             # 348 pytest, asyncio_mode=auto
+tests/             # 357 pytest, asyncio_mode=auto
 docs/cover.jpg     # обложка README
 state/             # runtime (топик-карта), gitignored
 logs/              # логи, gitignored
@@ -110,7 +110,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 - `/rm` — ответом на своё сообщение: удалить его в MAX (op 66).
 - `/del` — удалить топик с подтверждением (inline-кнопки).
 - `/help` — справка.
-- В личке: `/start` (меню: аккаунты, вход, группы), `/cancel`.
+- В личке: `/start` (меню: аккаунты, вход, группы), `/login [номер]` (вход по номеру+коду; при нескольких аккаунтах спросит какой), `/cancel`. `/login` в группе — удаляет сообщение и даёт deep-link `t.me/<bot>?start=login`. Меню команд публикуется через `set_my_commands` (`publish_commands`).
 
 ## Состояние / runtime
 
@@ -135,7 +135,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Тесты
 
-`pytest -q` → 348 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды + авторизация/watchdog/backoff + edit/delete/video/file RPC, tg_sender (split_html, пересоздание топика, reply, edit), msgmap, сквозные потоки listener/handler.
+`pytest -q` → 357 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды + авторизация/watchdog/backoff + edit/delete/video/file RPC, tg_sender (split_html, пересоздание топика, reply, edit), msgmap, сквозные потоки listener/handler.
 
 ## Деплой
 

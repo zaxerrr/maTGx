@@ -12,6 +12,7 @@ from telegram import Update
 from app.config import load_settings
 from app.accounts import AccountStore
 from app.bridge import Bridge
+from app.setup_bot import publish_commands
 from app.tg_handler import REGISTRY_KEY, build_bridge_app
 
 threading.stack_size(524288)
@@ -100,6 +101,7 @@ async def main():
     me = tg_app.bot.bot
     log.info("Telegram bot ready: @%s", me.username)
     await tg_app.start()
+    await publish_commands(tg_app.bot)
     await tg_app.updater.start_polling(drop_pending_updates=True,
                                        allowed_updates=Update.ALL_TYPES)
     if not settings.reply_enabled:

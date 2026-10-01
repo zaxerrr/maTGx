@@ -281,12 +281,81 @@ async def _on_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ── private chat: commands & buttons ──────────────────────────────
 
 async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _cmd_start_payload(update, context):
+        return
     if not await _owner_gate(update, context, claim=True):
         return
     br = _bridge(context)
     await _cancel_dialog(br, update.effective_user.id)
     text, kb = render_menu(br)
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+def _login_target(br) -> str | None:
+    """Which account /login should (re)log into, or None if ambiguous."""
+    accounts = br.store.accounts()
+    if not accounts:
+        return br.store.new_id()
+    if len(accounts) == 1:
+        return accounts[0].id
+    return None
+
+
+async def _cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/login [phone]`` — phone + code login without going through the menu.
+
+    One account (or none) → logs into it directly; several → asks which.
+    With a phone number in the command the code is requested right away.
+    """
+    if not await _owner_gate(update, context, claim=True):
+        return
+    br = _bridge(context)
+    uid = update.effective_user.id
+    message = update.effective_message
+    await _cancel_dialog(br, uid)
+    acc_id = _login_target(br)
+    if acc_id is None:
+        rows = [[B(f"🔑 {a.title} — {_account_status(br, a)}",
+                   callback_data=f"acc:phone:{a.id}")] for a in br.store.accounts()]
+        rows.append([B("➕ Новый аккаунт", callback_data=f"acc:phone:{br.store.new_id()}")])
+        await message.reply_text("В какой аккаунт MAX войти?", reply_markup=_kb(rows))
+        return
+    phone = " ".join(context.args or []).strip()
+    _start_dialog(br, uid, step="phone", acc_id=acc_id)
+    if phone:
+        await _step_phone(br, br.dialogs[uid], message, phone_text=phone)
+        return
+    await message.reply_text(
+        "📱 Пришлите номер телефона аккаунта MAX, например <code>+79991234567</code>.\n"
+        "Отмена — /cancel", parse_mode=ParseMode.HTML)
+
+
+async def _cmd_login_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Never take a phone or a code in a group: members would see them (and
+    their notifications keep the text even after the bot deletes it)."""
+    message = update.effective_message
+    if message is None:
+        return
+    try:
+        await message.delete()          # drop a number typed after /login
+    except Exception:
+        pass
+    username = context.bot.username
+    await context.bot.send_message(
+        chat_id=message.chat_id,
+        message_thread_id=message.message_thread_id if message.is_topic_message else None,
+        text="🔐 Вход в MAX — только в личке с ботом: номер и код в группе увидят все участники.",
+        reply_markup=_kb([[B("Войти в личке", url=f"https://t.me/{username}?start=login")]]),
+    )
+
+
+async def _cmd_start_payload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Deep link t.me/<bot>?start=login → straight into /login."""
+    if (context.args or [None])[0] == "login":
+        context.args = []
+        await _cmd_login(update, context)
+        return True
+    return False
 
 
 async def _cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -476,10 +545,10 @@ async def _on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _step_device(br, state, message, user.id)
 
 
-async def _step_phone(br, state, message) -> None:
+async def _step_phone(br, state, message, phone_text: str | None = None) -> None:
     login = PhoneLogin(proxy=br.max_proxy)
     try:
-        phone = await login.start(message.text)
+        phone = await login.start(phone_text if phone_text is not None else message.text)
     except LoginError as e:
         await message.reply_text(f"⚠️ {e}\nПришлите номер ещё раз или /cancel.")
         return
@@ -577,6 +646,35 @@ async def _save_credentials(br, message, acc_id, token, device_id, profile, phon
 
 # ── registration ──────────────────────────────────────────────────
 
+PRIVATE_COMMANDS = [
+    ("start", "Меню: аккаунты MAX, группы"),
+    ("login", "Войти в MAX по номеру и коду"),
+    ("cancel", "Прервать ввод"),
+]
+GROUP_COMMANDS = [
+    ("help", "Справка"),
+    ("profile", "Профиль собеседника (в теме)"),
+    ("intro", "Перепостить карточку (в теме)"),
+    ("rm", "Удалить своё сообщение в MAX (ответом)"),
+    ("bind", "Привязать тему к чату MAX"),
+    ("add", "Открыть ссылку max.ru/join"),
+    ("del", "Удалить тему"),
+    ("login", "Войти в MAX (откроет личку)"),
+]
+
+
+async def publish_commands(bot) -> None:
+    """Show the commands in Telegram's "/" menu (private vs. group lists)."""
+    from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
+    try:
+        await bot.set_my_commands([BotCommand(c, d) for c, d in PRIVATE_COMMANDS],
+                                  scope=BotCommandScopeAllPrivateChats())
+        await bot.set_my_commands([BotCommand(c, d) for c, d in GROUP_COMMANDS],
+                                  scope=BotCommandScopeAllGroupChats())
+    except Exception:
+        log.exception("set_my_commands failed")
+
+
 def register_setup_handlers(app: Application) -> None:
     private = filters.ChatType.PRIVATE
     # Discovery runs in its own handler group so it never blocks routing.
@@ -587,5 +685,7 @@ def register_setup_handlers(app: Application) -> None:
 
     app.add_handler(CommandHandler(["start", "menu", "accounts"], _cmd_start, filters=private))
     app.add_handler(CommandHandler("cancel", _cmd_cancel, filters=private))
+    app.add_handler(CommandHandler("login", _cmd_login, filters=private))
+    app.add_handler(CommandHandler("login", _cmd_login_in_group, filters=filters.ChatType.GROUPS))
     app.add_handler(CallbackQueryHandler(_on_setup_button, pattern=r"^(menu|acc:|grp:)"))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, _on_private_text))
