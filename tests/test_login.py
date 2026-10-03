@@ -164,3 +164,16 @@ class TestPhoneLoginClass:
                 await login.check_token("bad", "dev")
         finally:
             await runner.cleanup()
+
+
+class TestUnregisteredNumber:
+    async def test_register_token_is_reported_clearly(self, monkeypatch, tmp_path):
+        with pytest.raises(login.NotRegistered, match="не зарегистрирован"):
+            await TestFlow()._run(monkeypatch, tmp_path,
+                                  {"check": {"tokenAttrs": {"REGISTER": {"token": "r"}}}},
+                                  ["123456"])
+
+    def test_detection(self):
+        assert login._looks_unregistered({"tokenAttrs": {"REGISTER": {}}})
+        assert not login._looks_unregistered({"tokenAttrs": {"LOGIN": {"token": "x"}}})
+        assert not login._looks_unregistered({"passwordChallenge": {}})

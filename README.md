@@ -248,7 +248,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды, авторизация, watchdog, backoff), `app/tg_sender.py` (HTML-безопасная разбивка, пересоздание топика, ответы, правки), `app/msgmap.py`, сквозной поток MAX → TG (порядок, дубли, правки, лимиты) и TG → MAX (ответы, правки, `/rm`, медиа). 357 тестов.
+Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды, авторизация, watchdog, backoff), `app/tg_sender.py` (HTML-безопасная разбивка, пересоздание топика, ответы, правки), `app/msgmap.py`, сквозной поток MAX → TG (порядок, дубли, правки, лимиты) и TG → MAX (ответы, правки, `/rm`, медиа). 359 тестов.
 
 ### Структура проекта
 
@@ -268,7 +268,7 @@ max2tg/
 │   ├── bridge.py           # реестр: по клиенту MAX на аккаунт, маршрутизация группа+тема → аккаунт
 │   ├── setup_bot.py        # диалог настройки в личке, обнаружение групп бота
 │   └── topics.py           # TopicStore (JSON-карта)
-├── tests/                  # 357 pytest
+├── tests/                  # 359 pytest
 ├── docs/cover.jpg          # обложка README
 ├── state/                  # рантайм-данные (gitignored)
 ├── logs/                   # логи (gitignored)

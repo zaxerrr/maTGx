@@ -27,7 +27,7 @@ app/
   accounts.py      # AccountStore: state/accounts.json (0600) — owner_id, аккаунты MAX, известные группы
   bridge.py        # Bridge: по MaxClient+TelegramSender+TopicStore+MessageMap на аккаунт; resolve_topic(group, thread)
   setup_bot.py     # диалог в личке (/start, кнопки acc:/grp:), обнаружение групп (my_chat_member, миграция)
-tests/             # 357 pytest, asyncio_mode=auto
+tests/             # 359 pytest, asyncio_mode=auto
 docs/cover.jpg     # обложка README
 state/             # runtime (топик-карта), gitignored
 logs/              # логи, gitignored
@@ -135,7 +135,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Тесты
 
-`pytest -q` → 357 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды + авторизация/watchdog/backoff + edit/delete/video/file RPC, tg_sender (split_html, пересоздание топика, reply, edit), msgmap, сквозные потоки listener/handler.
+`pytest -q` → 359 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды + авторизация/watchdog/backoff + edit/delete/video/file RPC, tg_sender (split_html, пересоздание топика, reply, edit), msgmap, сквозные потоки listener/handler.
 
 ## Деплой
 
@@ -147,6 +147,7 @@ Docker. `docker-compose.yml` биндит `./logs:/app/logs` и `./state:/app/st
 - Voice MAX → TG: для нового `_type=UNSUPPORTED` нет рабочего download-опкода. Опкод 84/85 — calls service. Probing блокирован WS-disconnect на proto.payload.
 - `/u/<token>` (user share) — opcode 57 ищет в chat-namespace. Server hint «No link or token found» для `{token}` payload — обманчив, реально опкод хочет только `link` URL.
 - Удаление сообщений в MAX не зеркалится: событие удаления не найдено (смотреть `<<< EVENT` в логах). Правки MAX ловятся только если MAX повторно шлёт op=128 с тем же message id — не подтверждено на живом аккаунте.
+- Регистрация нового номера не реализована: протокол шага «имя/фамилия после CHECK_CODE» неизвестен (ни в vkmax, ни у нас). `check_code` распознаёт ответ без `tokenAttrs.LOGIN`, но с REGISTER-подобным ключом, и бросает `NotRegistered` с подсказкой зарегистрироваться в приложении. Чтобы реализовать — нужна запись WS-кадров регистрации из DevTools web.max.ru.
 - Phone/about для контакта — `CONTACT_GET` не возвращает. Нужен другой опкод (предположительно тот же, что юзает web.max.ru при открытии профиля справа).
 
 ## Если нужно ребутнуть знание о репо

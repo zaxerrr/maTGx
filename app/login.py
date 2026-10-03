@@ -115,6 +115,18 @@ def normalize_phone(raw: str) -> str:
     return "+" + digits
 
 
+class NotRegistered(LoginError):
+    """The code was right, but the number has no MAX account yet."""
+
+
+def _looks_unregistered(payload: dict) -> bool:
+    """CHECK_CODE for a new number yields a registration token instead of a
+    login one (exact shape unconfirmed — match on the key names)."""
+    attrs = payload.get("tokenAttrs") or {}
+    keys = {str(k).upper() for k in attrs} | {str(k).upper() for k in payload}
+    return any("REGIST" in k or k in ("NEW_USER", "SIGN_UP", "SIGNUP") for k in keys)
+
+
 def extract_login_token(payload: dict) -> str | None:
     token = ((payload.get("tokenAttrs") or {}).get("LOGIN") or {}).get("token")
     return token if isinstance(token, str) and token else None
@@ -137,6 +149,11 @@ async def check_code(rpc: _Rpc, sms_token: str, code: str) -> tuple[str, dict]:
     except LoginError as e:
         raise CodeRejected(str(e)) from e
     token = extract_login_token(resp)
+    if not token and _looks_unregistered(resp):
+        raise NotRegistered(
+            "этот номер не зарегистрирован в MAX. Зарегистрируйтесь в приложении MAX "
+            "(или на web.max.ru), затем повторите вход"
+        )
     if not token:
         # e.g. an account with a cloud password (2FA) — not supported yet.
         raise LoginError(
